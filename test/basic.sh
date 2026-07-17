@@ -161,6 +161,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 6d (sass3 interest channel): subrv7test -3 sends _SASS.<feed>.SUB
+# (SUBSCRIBE|INITIAL_VALUES, feed = first subject segment).  Cold subject:
+# the reply inbox must get TRANSIENT/NOT_FOUND (same one-code-path as
+# _SNAP).  The sass3 holder is real interest: a later _TIC publish must
+# forward to the bare subject.
+echo; echo "### Test 6d: sass3 subscribe => miss reply + interest-driven forward"
+if [ -x "$S7" ] && strings "$S7" | grep -q sass3; then
+  timeout 10 stdbuf -oL "$S7" -daemon tcp:$PORT -service $PORT -nodict -3 \
+    SASS.REC.T6D.NaE >"$TMP/miss6d.log" 2>&1 &
+  pids+=($!)
+  sleep 3
+  if grep -qiE "NOT_FOUND|TRANSIENT" "$TMP/miss6d.log"; then
+    ok "test6d sass3 initial miss reply contains TRANSIENT/NOT_FOUND"
+  else
+    no "test6d sass3 initial miss reply (silent miss)"
+  fi
+  "$PUB" $DNS -n "" -r -x -p 1 _TIC.SASS.REC.T6D.NaE >/dev/null 2>&1
+  sleep 2
+  if grep -q "SASS.REC.T6D.NaE" "$TMP/miss6d.log"; then
+    ok "test6d sass3 interest forwards a later tick to the bare subject"
+  else
+    no "test6d tick not forwarded on sass3 interest"
+  fi
+  echo "--- sass3 miss/forward log (head) ---"; sed -n '1,15p' "$TMP/miss6d.log"
+else
+  sk "test6d subrv7test lacks the -3/-sass3 flag"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 7 (miss path, broadcast mode): _SNAP.NO.SUCH -> TRANSIENT/NOT_FOUND
 echo; echo "### Test 7: snapshot miss => TRANSIENT / NOT_FOUND"
 timeout 6 "$CLI" $DNS -n "" -x -i -k 1 'NO.SUCH.%d' >"$TMP/snap7.log" 2>&1

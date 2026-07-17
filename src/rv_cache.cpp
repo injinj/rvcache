@@ -56,6 +56,7 @@ struct RvCache {
   void on_listen_start( RvSubscriptionListener::Start &add ) noexcept;
   void on_listen_stop( RvSubscriptionListener::Stop &rem ) noexcept;
   void on_snapshot( RvSubscriptionListener::Snap &snp ) noexcept;
+  void on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept;
   /* timers */
   void on_timer( void ) noexcept;
   void print_stats( bool final_totals ) noexcept;
@@ -76,12 +77,18 @@ struct RvCache {
   void emit_nosubscribers( const char *subj,  size_t len ) noexcept;
   void serve_snapshot( const char *subj,  size_t len,  const char *reply,
                        size_t reply_len,  const RvSessionEntry *sess,
-                       uint16_t flags ) noexcept;
+                       uint16_t flags,
+                       const RvSass3Entry *s3 = NULL ) noexcept;
+  /* miss: TRANSIENT / NOT_FOUND to the reply inbox (bcast-nack); the one
+   * code path shared by _SNAP, listen-start-inbox and sass3 requests */
+  void serve_miss( const char *subj,  size_t len,  const char *reply,
+                   size_t reply_len ) noexcept;
   void acct_event( const char *event,  const char *subj,  size_t sublen,
                    const RvSessionEntry *sess,  const char *proto,
                    uint16_t query_flags,  const char *reason,
                    double open_secs,  uint64_t msgs,
-                   uint64_t images ) noexcept;
+                   uint64_t images,
+                   const RvSass3Entry *s3 = NULL ) noexcept;
 };
 
 /* parse SASS header fields out of a raimd message */
@@ -370,6 +377,12 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
       this->acct_event( "initial", subj, len, &add.session, proto, 0,
                         NULL, 0, 0, 0 );
     }
+    else {
+      /* miss -> status to the inbox, never silence (spec 2): the
+       * requester attached an inbox precisely to learn the subject's
+       * state.  Interest stays registered; a later INITIAL broadcasts. */
+      this->serve_miss( subj, len, add.reply, add.reply_len );
+    }
   }
 }
 
@@ -413,7 +426,7 @@ RvCache::on_snapshot( RvSubscriptionListener::Snap &snp ) noexcept
 void
 RvCache::serve_snapshot( const char *subj,  size_t len,  const char *reply,
                          size_t reply_len,  const RvSessionEntry *sess,
-                         uint16_t flags ) noexcept
+                         uint16_t flags,  const RvSass3Entry *s3 ) noexcept
 {
   if ( reply == NULL || reply_len == 0 )
     return;
@@ -429,18 +442,77 @@ RvCache::serve_snapshot( const char *subj,  size_t len,  const char *reply,
                        e->image_enc );
     e->snap_count++;
     this->stats.snaps_served++;
-    this->acct_event( event, subj, len, sess, "snap", flags,
-                      NULL, 0, 0, 0 );
+    this->acct_event( event, subj, len, sess,
+                      s3 != NULL ? "sass3" : "snap", flags,
+                      NULL, 0, 0, 0, s3 );
   }
   else {
     /* broadcast-feed miss: TRANSIENT / NOT_FOUND immediately (bcast-nack) */
-    char buf[ 1024 ];
-    size_t n = this->build_status( (uint16_t) MD_TRANSIENT_TYPE,
-                                   (uint16_t) MD_NOT_FOUND_STATUS,
-                                   subj, len, buf, sizeof( buf ) );
-    this->publish_msg( reply, reply_len, NULL, 0, buf, n, RVMSG_TYPE_ID );
-    this->stats.snaps_missed++;
+    this->serve_miss( subj, len, reply, reply_len );
   }
+}
+
+void
+RvCache::serve_miss( const char *subj,  size_t len,  const char *reply,
+                     size_t reply_len ) noexcept
+{
+  char buf[ 1024 ];
+  size_t n = this->build_status( (uint16_t) MD_TRANSIENT_TYPE,
+                                 (uint16_t) MD_NOT_FOUND_STATUS,
+                                 subj, len, buf, sizeof( buf ) );
+  this->publish_msg( reply, reply_len, NULL, 0, buf, n, RVMSG_TYPE_ID );
+  this->stats.snaps_missed++;
+}
+
+/* sass3 interest on net 2 (submgr wildcard _SASS.<feed>.SUB channel).
+ * submgr owns the holder's life: it refs the subscription on a new
+ * holder, derefs on UNSUBSCRIBE and on lease expiry (480s), and fires
+ * this callback for each subject in the S submessage. */
+void
+RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept
+{
+  const char * subj = sa3.sub.value;
+  size_t       len  = sa3.sub.len;
+  if ( len == 0 || subj[ 0 ] == '_' )
+    return;
+
+  if ( ( sa3.flags & QF_UNSUBSCRIBE ) != 0 ) {
+    if ( sa3.is_orphan ) /* unsubscribe without subscribe */
+      return;
+    /* is_asserted on an UNSUBSCRIBE == submgr lease expiry sweep */
+    const char * reason = sa3.is_asserted ? "hold_timer" : "unsubscribe";
+    uint32_t     now    = this->cur_mono();
+    double open_secs = ( sa3.sass3.start_mono != 0 &&
+                         now >= sa3.sass3.start_mono ) ?
+                       (double) ( now - sa3.sass3.start_mono ) : 0.0;
+    CacheEntry * e = this->cache.find( subj, len );
+    this->acct_event( "unsubscribe", subj, len, NULL, "sass3", sa3.flags,
+                      reason, open_secs,
+                      e != NULL ? e->forward_count : 0,
+                      e != NULL ? e->snap_count : 0, &sa3.sass3 );
+    /* submgr already deref'd; refcnt 0 == last holder gone */
+    if ( sa3.sub.refcnt == 0 ) {
+      this->stats.interest_closes++;
+      this->emit_nosubscribers( subj, len );
+    }
+    return;
+  }
+
+  /* SUBSCRIBE (or a RESUBSCRIBE asserting a holder submgr didn't know):
+   * submgr already ref'd; refcnt 1 == subject went live */
+  if ( ( sa3.flags & QF_SUBSCRIBE ) != 0 || sa3.is_asserted ) {
+    if ( sa3.sub.refcnt == 1 )
+      this->stats.interest_opens++;
+    this->acct_event( "subscribe", subj, len, NULL, "sass3", sa3.flags,
+                      NULL, 0, 0, 0, &sa3.sass3 );
+  }
+
+  /* image request: SNAPSHOT / INITIAL_VALUES with a reply inbox;
+   * miss -> TRANSIENT/NOT_FOUND, same one-code-path as _SNAP */
+  if ( sa3.reply_len > 0 &&
+       ( sa3.flags & ( QF_SNAPSHOT | QF_INITIAL_VALUES ) ) != 0 )
+    this->serve_snapshot( subj, len, sa3.reply, sa3.reply_len, NULL,
+                          sa3.flags, &sa3.sass3 );
 }
 
 /* ------------------------------------------------------------------ */
@@ -518,7 +590,7 @@ RvCache::acct_event( const char *event,  const char *subj,  size_t sublen,
                      const RvSessionEntry *sess,  const char *proto,
                      uint16_t query_flags,  const char *reason,
                      double open_secs,  uint64_t msgs,
-                     uint64_t images ) noexcept
+                     uint64_t images,  const RvSass3Entry *s3 ) noexcept
 {
   if ( this->acct == NULL )
     return;
@@ -549,6 +621,12 @@ RvCache::acct_event( const char *event,  const char *subj,  size_t sublen,
              hostip, sess->host_id );
     fprintf( this->acct, ",\"session\":\"%.*s\"",
              (int) sess->len, sess->value );
+  }
+  if ( s3 != NULL ) {
+    /* sass3 holder identity from the SUB accounting submessage {U,H,A,P} */
+    fprintf( this->acct,
+             ",\"user\":\"%s\",\"host\":\"%s\",\"app\":\"%s\",\"pid\":%u",
+             s3->user_id, s3->host, s3->app, s3->pid );
   }
   if ( proto != NULL )
     fprintf( this->acct, ",\"protocol\":\"%s\",\"query_flags\":%u",
@@ -606,7 +684,10 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
     bool all = ( this->cache.cfg.wildcards.count == 0 );
     for ( size_t i = 0; i < this->cache.cfg.wildcards.count; i++ )
       this->sub_db.add_wildcard( this->cache.cfg.wildcards.ptr[ i ] );
-    this->sub_db.start_subscriptions( all );
+    /* both interest channels: sass2 (_RV.INFO advisories + _SNAP) and
+     * sass3 (_SASS.<feed>.SUB wildcard).  sass3-aware clients use sass3
+     * even on sass2-only networks, so a cache must listen to both. */
+    this->sub_db.start_subscriptions( all, true, true );
     this->poll.timer.add_timer_seconds( *this, 1, 1, 0 );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
@@ -634,6 +715,9 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
   }
   virtual void on_snapshot( Snap &snp ) noexcept {
     this->cache.on_snapshot( snp );
+  }
+  virtual void on_sass3( Sass3 &sa3 ) noexcept {
+    this->cache.on_sass3( sa3 );
   }
 };
 
