@@ -83,6 +83,13 @@ struct RvCache {
    * code path shared by _SNAP, listen-start-inbox and sass3 requests */
   void serve_miss( const char *subj,  size_t len,  const char *reply,
                    size_t reply_len ) noexcept;
+  /* asserted interest (sass2 query discovery / sass3 resubscribe of an
+   * unknown holder): broadcast an initial on the subject -- listeners
+   * that predate rv_cache converge on the image; no inbox involved */
+  void broadcast_initial( const char *subj,  size_t len,
+                          const RvSessionEntry *sess,
+                          const RvSass3Entry *s3,
+                          const char *proto ) noexcept;
   void acct_event( const char *event,  const char *subj,  size_t sublen,
                    const RvSessionEntry *sess,  const char *proto,
                    uint16_t query_flags,  const char *reason,
@@ -365,6 +372,14 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
   this->acct_event( "subscribe", subj, len, &add.session, proto, 0,
                     NULL, 0, 0, 0 );
 
+  /* interest asserted from a session/subscription query reply rather
+   * than a live advisory (no inbox on this path): rv_cache is
+   * (re)discovering listeners that predate it -- e.g. at startup.  If
+   * the subject just went live and an image exists, broadcast an
+   * initial so those listeners converge. */
+  if ( ! add.is_listen_start && add.sub.refcnt == 1 )
+    this->broadcast_initial( subj, len, &add.session, NULL, proto );
+
   /* initial-on-listen (rv5 path): the CLIENT controls this -- attaching an
    * inbox to the listen-start is the request for an initial.  No option. */
   if ( add.reply_len > 0 ) {
@@ -464,6 +479,23 @@ RvCache::serve_miss( const char *subj,  size_t len,  const char *reply,
   this->stats.snaps_missed++;
 }
 
+void
+RvCache::broadcast_initial( const char *subj,  size_t len,
+                            const RvSessionEntry *sess,
+                            const RvSass3Entry *s3,
+                            const char *proto ) noexcept
+{
+  CacheEntry * e = this->cache.find( subj, len );
+  if ( e == NULL || e->image == NULL )
+    return; /* cold: the feed's next INITIAL broadcasts normally */
+  this->stamp_msg_type( *e, (uint16_t) MD_INITIAL_TYPE );
+  this->publish_msg( subj, len, NULL, 0, e->image, e->image_len,
+                     e->image_enc );
+  e->snap_count++;
+  this->acct_event( "initial", subj, len, sess, proto, 0,
+                    NULL, 0, 0, 0, s3 );
+}
+
 /* sass3 interest on net 2 (submgr wildcard _SASS.<feed>.SUB channel).
  * submgr owns the holder's life: it refs the subscription on a new
  * holder, derefs on UNSUBSCRIBE and on lease expiry (480s), and fires
@@ -507,10 +539,21 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept
                       NULL, 0, 0, 0, &sa3.sass3 );
   }
 
-  /* image request: SNAPSHOT / INITIAL_VALUES with a reply inbox;
-   * miss -> TRANSIENT/NOT_FOUND, same one-code-path as _SNAP */
-  if ( sa3.reply_len > 0 &&
-       ( sa3.flags & ( QF_SNAPSHOT | QF_INITIAL_VALUES ) ) != 0 )
+  if ( sa3.is_asserted ) {
+    /* RESUBSCRIBE renewing a holder submgr didn't know: interest that
+     * predates rv_cache (startup rediscovery).  The holder already
+     * believes it is subscribed -- broadcast an initial on the subject
+     * so it (and every other listener) converges on the image.  The
+     * REFRESH bit here was OR'd in by submgr, not asked by the client,
+     * so nothing goes to the inbox. */
+    if ( sa3.sub.refcnt == 1 )
+      this->broadcast_initial( subj, len, NULL, &sa3.sass3, "sass3" );
+  }
+  /* image request to the inbox: SNAPSHOT (poll), INITIAL_VALUES
+   * (subscribe-image) or REFRESH (ask for another image); miss ->
+   * TRANSIENT/NOT_FOUND, same one-code-path as _SNAP */
+  else if ( sa3.reply_len > 0 &&
+       ( sa3.flags & ( QF_SNAPSHOT | QF_INITIAL_VALUES | QF_REFRESH ) ) != 0 )
     this->serve_snapshot( subj, len, sa3.reply, sa3.reply_len, NULL,
                           sa3.flags, &sa3.sass3 );
 }

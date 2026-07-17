@@ -266,10 +266,21 @@ struct CacheSubListener : public RvSubscriptionListener {
   clients may receive **double initial values**. sass3-aware clients know
   sass3 coexists on sass2 networks and **use sass3 even when only sass2
   exists** — so a sass3-enabled cache must expect sass3 interest from day
-  one. rv_cache will enable the sass3 channel alongside the sass2
-  variants; whether initials are deduped per subject+holder across the
-  two channels or the double-initial is accepted is an implementation
-  decision (production clients tolerate a duplicate initial).
+  one. rv_cache enables both channels; whether initials are deduped per
+  subject+holder across the two channels or the double-initial is
+  accepted is an implementation decision (production clients tolerate a
+  duplicate initial). `S3_REFRESH` from a client asks for **another image
+  to the reply inbox** (serve like SNAPSHOT/INITIAL_VALUES).
+- **Asserted interest → broadcast an initial.** When rv_cache discovers
+  interest it did not see arrive — a sass2 subscription-query reply
+  (`Start.is_listen_start == false`, no inbox) or a sass3 RESUBSCRIBE
+  renewing a holder submgr didn't know (`Sass3.is_asserted`, REFRESH
+  OR'd in by submgr, not the client) — those listeners predate the
+  cache (typical at rv_cache startup) and already believe they are
+  subscribed. If the subject just went live (refcnt 1) and an image
+  exists, **broadcast an INITIAL on the subject** so every such
+  listener converges; nothing goes to any inbox. Cache still cold →
+  broadcast nothing: the feed's next INITIAL broadcasts normally.
 
 - Constructed with a wildcard filter (`add_wildcard()`); default is
   everything except `_`-prefixed subjects, `-w RSF.>` style flag to narrow.
