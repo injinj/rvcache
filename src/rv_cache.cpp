@@ -3,7 +3,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <new>
 #include <rvcache/cache.h>
+#include <raimd/json.h>
 #include <raimd/md_msg.h>
 #include <raimd/md_dict.h>
 #include <raimd/rv_msg.h>
@@ -33,17 +37,20 @@ struct RvCache {
   Config         & cfg;
   CacheTab         cache;
   Stats            stats;
-  EvRvClient     * feed_conn,   /* net 1 (upstream _TIC.>) */
-                 * sub_conn,    /* net 2 (downstream, sass2) */
-                 * sub_conn3;   /* net 4 (downstream, sass3), may be NULL */
-  RvSubscriptionDB * sub_db,    /* submgr on net 2 */
-                   * sub_db3;   /* submgr on net 4 (sass3-only), or NULL */
-  FILE           * acct;
-  char             pubbuf[ 64 * 1024 ];
+  /* network attachments by mask bit (idx - 1); feeds have conns only */
+  EvRvClient       * sub_conns[ MAX_NETS ];
+  RvSubscriptionDB * sub_dbs[ MAX_NETS ];
+  uint64_t           sub_nets;  /* mask of configured sub nets */
+  FILE             * acct;
+  char               pubbuf[ 64 * 1024 ];
 
   RvCache( EvPoll &p,  Config &c )
-    : poll( p ), cfg( c ), feed_conn( 0 ), sub_conn( 0 ), sub_conn3( 0 ),
-      sub_db( 0 ), sub_db3( 0 ), acct( 0 ) {}
+    : poll( p ), cfg( c ), sub_nets( 0 ), acct( 0 ) {
+    for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
+      this->sub_conns[ i ] = NULL;
+      this->sub_dbs[ i ]   = NULL;
+    }
+  }
 
   uint32_t cur_mono( void ) const {
     return (uint32_t) ( this->poll.mono_ns / (uint64_t) 1000000000 );
@@ -54,41 +61,47 @@ struct RvCache {
   void on_feed_msg( EvPublish &pub ) noexcept;
   void handle_tic( const char *subj,  size_t len,  const void *msg,
                    size_t msg_len,  uint32_t enc ) noexcept;
-  /* interest (submgr callbacks on net 2) */
-  void on_listen_start( RvSubscriptionListener::Start &add ) noexcept;
-  void on_listen_stop( RvSubscriptionListener::Stop &rem ) noexcept;
-  void on_snapshot( RvSubscriptionListener::Snap &snp ) noexcept;
-  void on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept;
+  /* interest (submgr callbacks; net = mask bit of the sub network) */
+  void on_listen_start( RvSubscriptionListener::Start &add,
+                        uint32_t net ) noexcept;
+  void on_listen_stop( RvSubscriptionListener::Stop &rem,
+                       uint32_t net ) noexcept;
+  void on_snapshot( RvSubscriptionListener::Snap &snp,
+                    uint32_t net ) noexcept;
+  void on_sass3( RvSubscriptionListener::Sass3 &sa3,  uint32_t net ) noexcept;
   /* timers */
   void on_timer( void ) noexcept;
   void print_stats( bool final_totals ) noexcept;
 
   /* helpers */
-  /* forwarding gate: read-only find in submgr's sub_tab; submgr owns the
-   * subscription's life (advisory START/STOP, session/host sweeps, GC) */
-  uint32_t sub_refcnt( const char *subj,  size_t len ) noexcept;
   /* stamp MSG_TYPE (leading fixed-width int, normalized at store time)
    * directly into the cached image via MDFieldIter::update() */
   bool stamp_msg_type( CacheEntry &e,  uint16_t msg_type ) noexcept;
-  void publish_msg( const char *subj,  size_t len,  const char *reply,
-                    size_t reply_len,  const void *msg,  size_t msg_len,
-                    uint32_t enc ) noexcept;
+  /* publish to one sub net (replies, per-net broadcasts) */
+  void publish_msg( uint32_t net,  const char *subj,  size_t len,
+                    const char *reply,  size_t reply_len,  const void *msg,
+                    size_t msg_len,  uint32_t enc ) noexcept;
+  /* publish to every sub net whose fwd_mask bit is set (tick forwards) */
+  void publish_mask( uint64_t mask,  const char *subj,  size_t len,
+                     const void *msg,  size_t msg_len,
+                     uint32_t enc ) noexcept;
   size_t build_status( uint16_t msg_type,  uint16_t rec_status,
                        const char *subj,  size_t len,  char *buf,
                        size_t buflen ) noexcept;
-  void emit_nosubscribers( const char *subj,  size_t len ) noexcept;
-  void serve_snapshot( const char *subj,  size_t len,  const char *reply,
-                       size_t reply_len,  const RvSessionEntry *sess,
-                       uint16_t flags,
+  void emit_nosubscribers( uint32_t net,  const char *subj,
+                           size_t len ) noexcept;
+  void serve_snapshot( uint32_t net,  const char *subj,  size_t len,
+                       const char *reply,  size_t reply_len,
+                       const RvSessionEntry *sess,  uint16_t flags,
                        const RvSass3Entry *s3 = NULL ) noexcept;
   /* miss: TRANSIENT / NOT_FOUND to the reply inbox (bcast-nack); the one
    * code path shared by _SNAP, listen-start-inbox and sass3 requests */
-  void serve_miss( const char *subj,  size_t len,  const char *reply,
-                   size_t reply_len ) noexcept;
+  void serve_miss( uint32_t net,  const char *subj,  size_t len,
+                   const char *reply,  size_t reply_len ) noexcept;
   /* asserted interest (sass2 query discovery / sass3 resubscribe of an
    * unknown holder): broadcast an initial on the subject -- listeners
    * that predate rv_cache converge on the image; no inbox involved */
-  void broadcast_initial( const char *subj,  size_t len,
+  void broadcast_initial( uint32_t net,  const char *subj,  size_t len,
                           const RvSessionEntry *sess,
                           const RvSass3Entry *s3,
                           const char *proto ) noexcept;
@@ -129,31 +142,6 @@ parse_sass( MDMsg *m,  uint16_t &msg_type,  uint32_t &seqno,  bool &has_type,
     has_status = true;
   }
   return true;
-}
-
-/* ------------------------------------------------------------------ */
-uint32_t
-RvCache::sub_refcnt( const char *subj,  size_t len ) noexcept
-{
-  /* _SNAP-created entries exist with refcnt 0 -- not interest.
-   * TODO(can-wildcard): a client wildcard listen (TEST.>) makes an entry
-   * under the wildcard subject; matching concrete ticks against wildcard
-   * subscriptions is not implemented yet. */
-  uint32_t h = kv_crc_c( subj, len, 0 ), cnt = 0;
-  RouteLoc loc;
-  if ( this->sub_db != NULL ) {
-    RvSubscription * s = this->sub_db->sub_tab.find( h, subj, len, loc );
-    if ( s != NULL )
-      cnt += s->refcnt;
-  }
-  /* separate sass3 network (net 4): independent submgr, independent
-   * refcnts; the forwarding gate ORs across the interest databases */
-  if ( this->sub_db3 != NULL ) {
-    RvSubscription * s = this->sub_db3->sub_tab.find( h, subj, len, loc );
-    if ( s != NULL )
-      cnt += s->refcnt;
-  }
-  return cnt;
 }
 
 /* stamp the delivery MSG_TYPE into the cached image in place.  set_image
@@ -199,22 +187,29 @@ RvCache::stamp_msg_type( CacheEntry &e,  uint16_t msg_type ) noexcept
 
 /* ------------------------------------------------------------------ */
 void
-RvCache::publish_msg( const char *subj,  size_t len,  const char *reply,
-                      size_t reply_len,  const void *msg,  size_t msg_len,
-                      uint32_t enc ) noexcept
+RvCache::publish_msg( uint32_t net,  const char *subj,  size_t len,
+                      const char *reply,  size_t reply_len,  const void *msg,
+                      size_t msg_len,  uint32_t enc ) noexcept
 {
+  EvRvClient * c = net < MAX_NETS ? this->sub_conns[ net ] : NULL;
+  if ( c == NULL )
+    return;
   uint32_t h = kv_crc_c( subj, len, 0 );
-  if ( this->sub_conn != NULL ) {
-    EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
-                   this->sub_conn->sub_route, *this->sub_conn, h, enc );
-    this->sub_conn->publish( pub );
-  }
-  /* separate sass3 network: same payload to net 4.  _INBOX replies are
-   * point-to-point -- the daemon without that inbox drops them. */
-  if ( this->sub_conn3 != NULL ) {
-    EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
-                   this->sub_conn3->sub_route, *this->sub_conn3, h, enc );
-    this->sub_conn3->publish( pub );
+  EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
+                 c->sub_route, *c, h, enc );
+  c->publish( pub );
+}
+
+void
+RvCache::publish_mask( uint64_t mask,  const char *subj,  size_t len,
+                       const void *msg,  size_t msg_len,
+                       uint32_t enc ) noexcept
+{
+  mask &= this->sub_nets;
+  while ( mask != 0 ) {
+    uint32_t net = (uint32_t) __builtin_ctzll( mask );
+    mask &= mask - 1;
+    this->publish_msg( net, subj, len, NULL, 0, msg, msg_len, enc );
   }
 }
 
@@ -233,13 +228,14 @@ RvCache::build_status( uint16_t msg_type,  uint16_t rec_status,
 }
 
 void
-RvCache::emit_nosubscribers( const char *subj,  size_t len ) noexcept
+RvCache::emit_nosubscribers( uint32_t net,  const char *subj,
+                             size_t len ) noexcept
 {
   char buf[ 1024 ];
   size_t n = this->build_status( (uint16_t) MD_DROP_TYPE,
                                  (uint16_t) MD_NOSUBSCRIBERS_STATUS,
                                  subj, len, buf, sizeof( buf ) );
-  this->publish_msg( subj, len, NULL, 0, buf, n, RVMSG_TYPE_ID );
+  this->publish_msg( net, subj, len, NULL, 0, buf, n, RVMSG_TYPE_ID );
   this->stats.nosub_sent++;
 }
 
@@ -356,15 +352,17 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
     }
   }
 
-  /* forwarding decision: read-only find in submgr's sub_tab, gate on
-   * refcnt != 0.  submgr controls the subscription's life; there is no
-   * parallel interest table and no RV-side decay timer. */
-  if ( this->sub_refcnt( subj, len ) != 0 ) {
-    this->publish_msg( subj, len, NULL, 0, fwd_msg, fwd_len, fwd_enc );
+  /* forwarding decision: per-net forwarding bools on the cache entry
+   * (fwd_mask).  A subscribe with refcnt > 0 on a net set its bit, an
+   * unsubscribe with refcnt == 0 cleared it; submgr still owns the
+   * subscription's life -- the mask is just the materialized gate.
+   * Forward goes ONLY to nets whose bit is set. */
+  CacheEntry * fe = this->cache.find( subj, len );
+  uint64_t     mask = ( fe != NULL ? fe->fwd_mask : 0 );
+  if ( mask != 0 ) {
+    this->publish_mask( mask, subj, len, fwd_msg, fwd_len, fwd_enc );
     this->stats.ticks_forwarded++;
-    CacheEntry * fe = this->cache.find( subj, len );
-    if ( fe != NULL )
-      fe->forward_count++;
+    fe->forward_count++;
   }
   else {
     this->stats.dropped_no_listener++;
@@ -373,7 +371,8 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
 
 /* ------------------------------------------------------------------ */
 void
-RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
+RvCache::on_listen_start( RvSubscriptionListener::Start &add,
+                          uint32_t net ) noexcept
 {
   const char * subj = add.sub.value;
   size_t       len  = add.sub.len;
@@ -384,6 +383,9 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
     return;
   const char * proto = add.session.has_daemon ? "rv7" : "rv5";
 
+  /* subscribe with refcnt > 0: set this net's forwarding bit */
+  if ( add.sub.refcnt > 0 )
+    this->cache.interest_set( subj, len, net );
   /* submgr already ref'd the subscription; refcnt 1 == subject went live */
   if ( add.sub.refcnt == 1 )
     this->stats.interest_opens++;
@@ -396,7 +398,7 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
    * the subject just went live and an image exists, broadcast an
    * initial so those listeners converge. */
   if ( ! add.is_listen_start && add.sub.refcnt == 1 )
-    this->broadcast_initial( subj, len, &add.session, NULL, proto );
+    this->broadcast_initial( net, subj, len, &add.session, NULL, proto );
 
   /* initial-on-listen (rv5 path): the CLIENT controls this -- attaching an
    * inbox to the listen-start is the request for an initial.  No option. */
@@ -404,7 +406,7 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
     CacheEntry * e = this->cache.find( subj, len );
     if ( e != NULL && e->image != NULL ) {
       this->stamp_msg_type( *e, (uint16_t) MD_INITIAL_TYPE );
-      this->publish_msg( add.reply, add.reply_len, NULL, 0, e->image,
+      this->publish_msg( net, add.reply, add.reply_len, NULL, 0, e->image,
                          e->image_len, e->image_enc );
       e->snap_count++;
       this->acct_event( "initial", subj, len, &add.session, proto, 0,
@@ -414,13 +416,14 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add ) noexcept
       /* miss -> status to the inbox, never silence (spec 2): the
        * requester attached an inbox precisely to learn the subject's
        * state.  Interest stays registered; a later INITIAL broadcasts. */
-      this->serve_miss( subj, len, add.reply, add.reply_len );
+      this->serve_miss( net, subj, len, add.reply, add.reply_len );
     }
   }
 }
 
 void
-RvCache::on_listen_stop( RvSubscriptionListener::Stop &rem ) noexcept
+RvCache::on_listen_stop( RvSubscriptionListener::Stop &rem,
+                         uint32_t net ) noexcept
 {
   const char * subj = rem.sub.value;
   size_t       len  = rem.sub.len;
@@ -440,26 +443,30 @@ RvCache::on_listen_stop( RvSubscriptionListener::Stop &rem ) noexcept
                     e != NULL ? e->forward_count : 0,
                     e != NULL ? e->snap_count : 0 );
 
-  /* submgr already deref'd; refcnt 0 == last holder gone */
+  /* submgr already deref'd; refcnt 0 == last holder gone on this net:
+   * clear the forwarding bit */
   if ( rem.sub.refcnt == 0 ) {
+    this->cache.interest_clear( subj, len, net );
     this->stats.interest_closes++;
-    this->emit_nosubscribers( subj, len );
+    this->emit_nosubscribers( net, subj, len );
   }
 }
 
 void
-RvCache::on_snapshot( RvSubscriptionListener::Snap &snp ) noexcept
+RvCache::on_snapshot( RvSubscriptionListener::Snap &snp,
+                      uint32_t net ) noexcept
 {
   /* submgr resolved the requester's session from the reply inbox; its
    * user_id attributes the request for accounting */
-  this->serve_snapshot( snp.sub.value, snp.sub.len, snp.reply, snp.reply_len,
-                        &snp.session, snp.flags );
+  this->serve_snapshot( net, snp.sub.value, snp.sub.len, snp.reply,
+                        snp.reply_len, &snp.session, snp.flags );
 }
 
 void
-RvCache::serve_snapshot( const char *subj,  size_t len,  const char *reply,
-                         size_t reply_len,  const RvSessionEntry *sess,
-                         uint16_t flags,  const RvSass3Entry *s3 ) noexcept
+RvCache::serve_snapshot( uint32_t net,  const char *subj,  size_t len,
+                         const char *reply,  size_t reply_len,
+                         const RvSessionEntry *sess,  uint16_t flags,
+                         const RvSass3Entry *s3 ) noexcept
 {
   if ( reply == NULL || reply_len == 0 )
     return;
@@ -471,8 +478,8 @@ RvCache::serve_snapshot( const char *subj,  size_t len,  const char *reply,
     const char * event      = is_initial ? "initial" : "snapshot";
     this->stamp_msg_type( *e, (uint16_t)
                           ( is_initial ? MD_INITIAL_TYPE : MD_SNAPSHOT_TYPE ) );
-    this->publish_msg( reply, reply_len, NULL, 0, e->image, e->image_len,
-                       e->image_enc );
+    this->publish_msg( net, reply, reply_len, NULL, 0, e->image,
+                       e->image_len, e->image_enc );
     e->snap_count++;
     this->stats.snaps_served++;
     this->acct_event( event, subj, len, sess,
@@ -481,24 +488,24 @@ RvCache::serve_snapshot( const char *subj,  size_t len,  const char *reply,
   }
   else {
     /* broadcast-feed miss: TRANSIENT / NOT_FOUND immediately (bcast-nack) */
-    this->serve_miss( subj, len, reply, reply_len );
+    this->serve_miss( net, subj, len, reply, reply_len );
   }
 }
 
 void
-RvCache::serve_miss( const char *subj,  size_t len,  const char *reply,
-                     size_t reply_len ) noexcept
+RvCache::serve_miss( uint32_t net,  const char *subj,  size_t len,
+                     const char *reply,  size_t reply_len ) noexcept
 {
   char buf[ 1024 ];
   size_t n = this->build_status( (uint16_t) MD_TRANSIENT_TYPE,
                                  (uint16_t) MD_NOT_FOUND_STATUS,
                                  subj, len, buf, sizeof( buf ) );
-  this->publish_msg( reply, reply_len, NULL, 0, buf, n, RVMSG_TYPE_ID );
+  this->publish_msg( net, reply, reply_len, NULL, 0, buf, n, RVMSG_TYPE_ID );
   this->stats.snaps_missed++;
 }
 
 void
-RvCache::broadcast_initial( const char *subj,  size_t len,
+RvCache::broadcast_initial( uint32_t net,  const char *subj,  size_t len,
                             const RvSessionEntry *sess,
                             const RvSass3Entry *s3,
                             const char *proto ) noexcept
@@ -507,7 +514,7 @@ RvCache::broadcast_initial( const char *subj,  size_t len,
   if ( e == NULL || e->image == NULL )
     return; /* cold: the feed's next INITIAL broadcasts normally */
   this->stamp_msg_type( *e, (uint16_t) MD_INITIAL_TYPE );
-  this->publish_msg( subj, len, NULL, 0, e->image, e->image_len,
+  this->publish_msg( net, subj, len, NULL, 0, e->image, e->image_len,
                      e->image_enc );
   e->snap_count++;
   this->acct_event( "initial", subj, len, sess, proto, 0,
@@ -519,7 +526,8 @@ RvCache::broadcast_initial( const char *subj,  size_t len,
  * holder, derefs on UNSUBSCRIBE and on lease expiry (480s), and fires
  * this callback for each subject in the S submessage. */
 void
-RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept
+RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3,
+                   uint32_t net ) noexcept
 {
   const char * subj = sa3.sub.value;
   size_t       len  = sa3.sub.len;
@@ -540,10 +548,12 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept
                       reason, open_secs,
                       e != NULL ? e->forward_count : 0,
                       e != NULL ? e->snap_count : 0, &sa3.sass3 );
-    /* submgr already deref'd; refcnt 0 == last holder gone */
+    /* submgr already deref'd; refcnt 0 == last holder gone on this net:
+     * clear the forwarding bit */
     if ( sa3.sub.refcnt == 0 ) {
+      this->cache.interest_clear( subj, len, net );
       this->stats.interest_closes++;
-      this->emit_nosubscribers( subj, len );
+      this->emit_nosubscribers( net, subj, len );
     }
     return;
   }
@@ -551,6 +561,8 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept
   /* SUBSCRIBE (or a RESUBSCRIBE asserting a holder submgr didn't know):
    * submgr already ref'd; refcnt 1 == subject went live */
   if ( ( sa3.flags & QF_SUBSCRIBE ) != 0 || sa3.is_asserted ) {
+    if ( sa3.sub.refcnt > 0 )
+      this->cache.interest_set( subj, len, net );
     if ( sa3.sub.refcnt == 1 )
       this->stats.interest_opens++;
     this->acct_event( "subscribe", subj, len, NULL, "sass3", sa3.flags,
@@ -565,14 +577,14 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3 ) noexcept
      * REFRESH bit here was OR'd in by submgr, not asked by the client,
      * so nothing goes to the inbox. */
     if ( sa3.sub.refcnt == 1 )
-      this->broadcast_initial( subj, len, NULL, &sa3.sass3, "sass3" );
+      this->broadcast_initial( net, subj, len, NULL, &sa3.sass3, "sass3" );
   }
   /* image request to the inbox: SNAPSHOT (poll), INITIAL_VALUES
    * (subscribe-image) or REFRESH (ask for another image); miss ->
    * TRANSIENT/NOT_FOUND, same one-code-path as _SNAP */
   else if ( sa3.reply_len > 0 &&
        ( sa3.flags & ( QF_SNAPSHOT | QF_INITIAL_VALUES | QF_REFRESH ) ) != 0 )
-    this->serve_snapshot( subj, len, sa3.reply, sa3.reply_len, NULL,
+    this->serve_snapshot( net, subj, len, sa3.reply, sa3.reply_len, NULL,
                           sa3.flags, &sa3.sass3 );
 }
 
@@ -609,13 +621,13 @@ RvCache::print_stats( bool final_totals ) noexcept
 {
   size_t subj = this->cache.count();
   size_t holders = 0, subjects_held = 0;
-  RvSubscriptionDB * dbs[ 2 ] = { this->sub_db, this->sub_db3 };
-  for ( int i = 0; i < 2; i++ ) {
-    if ( dbs[ i ] == NULL )
+  for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
+    RvSubscriptionDB * db = this->sub_dbs[ i ];
+    if ( db == NULL )
       continue;
     RouteLoc loc;
-    for ( RvSubscription * s = dbs[ i ]->sub_tab.first( loc ); s != NULL;
-          s = dbs[ i ]->sub_tab.next( loc ) ) {
+    for ( RvSubscription * s = db->sub_tab.first( loc ); s != NULL;
+          s = db->sub_tab.next( loc ) ) {
       if ( s->refcnt != 0 && s->len > 0 && s->value[ 0 ] != '_' ) {
         subjects_held++;
         holders += s->refcnt;
@@ -640,14 +652,13 @@ RvCache::print_stats( bool final_totals ) noexcept
     (unsigned long long) this->stats.seq_regress,
     (unsigned long long) this->stats.seq_gap,
     (unsigned long long) this->stats.transient_pass );
-  if ( this->sub_db != NULL )
-    printf( " | db.sub[a=%u r=%u] hosts=%u sess=%u",
-      this->sub_db->subscriptions.active, this->sub_db->subscriptions.removed,
-      this->sub_db->hosts.active, this->sub_db->sessions.active );
-  if ( this->sub_db3 != NULL )
-    printf( " | db3.sub[a=%u r=%u]",
-      this->sub_db3->subscriptions.active,
-      this->sub_db3->subscriptions.removed );
+  for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
+    RvSubscriptionDB * db = this->sub_dbs[ i ];
+    if ( db != NULL )
+      printf( " | net%u.sub[a=%u r=%u] hosts=%u sess=%u", i + 1,
+        db->subscriptions.active, db->subscriptions.removed,
+        db->hosts.active, db->sessions.active );
+  }
   printf( "\n" );
   fflush( stdout );
 }
@@ -708,24 +719,28 @@ RvCache::acct_event( const char *event,  const char *subj,  size_t sublen,
 }
 
 /* ================================================================== */
-/* net 1 (feed) callback */
+/* feed net callback (any number of feed networks feed the one cache) */
 struct FeedCB : public EvConnectionNotify, public RvClientCB {
   EvPoll     & poll;
   EvRvClient & client;
   RvCache    & cache;
-  FeedCB( EvPoll &p,  EvRvClient &c,  RvCache &rc )
-    : poll( p ), client( c ), cache( rc ) {}
+  char         label[ 24 ];
+  FeedCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  uint32_t idx )
+    : poll( p ), client( c ), cache( rc ) {
+    ::snprintf( this->label, sizeof( this->label ), "feed(net%u)", idx );
+  }
   virtual void on_connect( EvSocket &conn ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
-    printf( "feed(net1) connected: %.*s\n", len, conn.peer_address.buf );
+    printf( "%s connected: %.*s\n", this->label, len,
+            conn.peer_address.buf );
     fflush( stdout );
     this->client.subscribe( "_TIC.>", 6 );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
                             size_t errlen ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
-    printf( "feed(net1) shutdown: %.*s %.*s\n", len, conn.peer_address.buf,
-            (int) errlen, err );
+    printf( "%s shutdown: %.*s %.*s\n", this->label, len,
+            conn.peer_address.buf, (int) errlen, err );
     if ( this->poll.quit == 0 )
       this->poll.quit = 1;
   }
@@ -735,24 +750,26 @@ struct FeedCB : public EvConnectionNotify, public RvClientCB {
   }
 };
 
-/* nets 2/4 (sub / submgr) callback.  The sass2 and sass3 interest
- * channels differ ONLY in the start_subscriptions() enables:
- * collapsed (no -4): one instance, both channels on net 2;
- * separate networks (-4): net 2 = (all, true, false) sass2-only,
- * net 4 = (all, false, true) sass3-only, each with its own submgr. */
+/* sub net callback (any number).  The sass2 and sass3 interest channels
+ * differ ONLY in the start_subscriptions() enables; one submgr instance
+ * per sub network, each with its own sub_tab/refcnts.  net = mask bit. */
 struct SubCB : public EvConnectionNotify, public RvClientCB,
                public EvTimerCallback, public RvSubscriptionListener {
   EvPoll         & poll;
   EvRvClient     & client;
   RvCache        & cache;
   RvSubscriptionDB sub_db;
-  const char     * label;   /* "sub(net2)" / "sass3(net4)" */
+  uint32_t         net;     /* fwd_mask bit == idx - 1 */
+  char             label[ 24 ];
   bool             s2, s3,  /* interest channels to enable */
                    primary; /* runs the cache timer (once per process) */
-  SubCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  const char *lbl,
+  SubCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  uint32_t idx,
          bool sass2,  bool sass3,  bool prim )
-    : poll( p ), client( c ), cache( rc ), sub_db( c, this ), label( lbl ),
-      s2( sass2 ), s3( sass3 ), primary( prim ) {}
+    : poll( p ), client( c ), cache( rc ), sub_db( c, this ),
+      net( idx - 1 ), s2( sass2 ), s3( sass3 ), primary( prim ) {
+    ::snprintf( this->label, sizeof( this->label ), "sub(net%u%s%s)", idx,
+                sass2 ? ",s2" : "", sass3 ? ",s3" : "" );
+  }
 
   virtual void on_connect( EvSocket &conn ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
@@ -784,16 +801,16 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
     return true;
   }
   virtual void on_listen_start( Start &add ) noexcept {
-    this->cache.on_listen_start( add );
+    this->cache.on_listen_start( add, this->net );
   }
   virtual void on_listen_stop( Stop &rem ) noexcept {
-    this->cache.on_listen_stop( rem );
+    this->cache.on_listen_stop( rem, this->net );
   }
   virtual void on_snapshot( Snap &snp ) noexcept {
-    this->cache.on_snapshot( snp );
+    this->cache.on_snapshot( snp, this->net );
   }
   virtual void on_sass3( Sass3 &sa3 ) noexcept {
-    this->cache.on_sass3( sa3 );
+    this->cache.on_sass3( sa3, this->net );
   }
 };
 
@@ -812,28 +829,148 @@ get_arg( int &x,  int argc,  const char *argv[],  int b,  const char *f,
   return def;
 }
 
-/* parse "d,n,s" (any field may be empty) into a NetParm; returns true */
-static void
-parse_triple( const char *s,  NetParm &np ) noexcept
+/* split s on ',' into up to n fields (empty fields -> NULL); modifies s */
+static int
+split_fields( char *s,  const char *f[],  int n ) noexcept
 {
-  if ( s == NULL )
-    return;
-  char * dup = ::strdup( s );
-  char * d = dup;
-  char * c1 = ::strchr( d, ',' );
-  if ( c1 != NULL ) {
-    *c1 = '\0';
-    char * n = c1 + 1;
-    char * c2 = ::strchr( n, ',' );
-    if ( c2 != NULL ) {
-      *c2 = '\0';
-      char * sv = c2 + 1;
-      if ( *sv ) np.service = ::strdup( sv );
-    }
-    if ( *n ) np.network = ::strdup( n );
+  int cnt = 0;
+  while ( cnt < n ) {
+    f[ cnt++ ] = ( *s != '\0' && *s != ',' ) ? s : NULL;
+    char * c = ::strchr( s, ',' );
+    if ( c == NULL )
+      break;
+    *c = '\0';
+    s = c + 1;
   }
-  if ( *d ) np.daemon = ::strdup( d );
+  return cnt;
+}
+
+static bool
+parse_role_proto( NetDef &nd,  const char *role,  const char *proto ) noexcept
+{
+  if ( role == NULL )
+    return false;
+  if ( ::strcmp( role, "feed" ) == 0 )
+    nd.is_feed = true;
+  else if ( ::strcmp( role, "sub" ) == 0 )
+    nd.is_feed = false;
+  else
+    return false;
+  if ( proto == NULL || ::strcmp( proto, "both" ) == 0 ||
+       ::strcmp( proto, "sass2+sass3" ) == 0 ) {
+    nd.s2 = true; nd.s3 = true;
+  }
+  else if ( ::strcmp( proto, "sass2" ) == 0 ) {
+    nd.s2 = true; nd.s3 = false;
+  }
+  else if ( ::strcmp( proto, "sass3" ) == 0 ) {
+    nd.s2 = false; nd.s3 = true;
+  }
+  else
+    return false;
+  return true;
+}
+
+/* parse "role,proto[,daemon[,network[,service]]]" into a NetDef */
+static bool
+parse_net_tuple( uint32_t idx,  const char *s,  NetDef &nd ) noexcept
+{
+  char       * dup = ::strdup( s );
+  const char * f[ 5 ] = { NULL, NULL, NULL, NULL, NULL };
+  split_fields( dup, f, 5 );
+  nd.idx = idx;
+  if ( ! parse_role_proto( nd, f[ 0 ], f[ 1 ] ) ) {
+    ::free( dup );
+    return false;
+  }
+  if ( f[ 2 ] != NULL ) nd.parm.daemon  = ::strdup( f[ 2 ] );
+  if ( f[ 3 ] != NULL ) nd.parm.network = ::strdup( f[ 3 ] );
+  if ( f[ 4 ] != NULL ) nd.parm.service = ::strdup( f[ 4 ] );
   ::free( dup );
+  return true;
+}
+
+/* json/yaml nets config: an array (or { "nets": [...] }) of objects:
+ * { "index": 1, "role": "feed", "proto": "sass2",
+ *   "daemon": "tcp:7500", "network": "", "service": "7500" } */
+static const char *
+json_str( JsonObject *o,  const char *name ) noexcept
+{
+  JsonValue * v = o->find( name );
+  if ( v == NULL || v->type != JSON_STRING )
+    return NULL;
+  JsonString * s = v->to_str();
+  if ( s->length == 0 )
+    return NULL;
+  char * cp = (char *) ::malloc( s->length + 1 );
+  ::memcpy( cp, s->val, s->length );
+  cp[ s->length ] = '\0';
+  return cp;
+}
+
+static bool
+load_nets_config( const char *path,  Config &cfg ) noexcept
+{
+  int fd = ::open( path, O_RDONLY );
+  if ( fd < 0 ) {
+    perror( path );
+    return false;
+  }
+  size_t plen = ::strlen( path );
+  bool is_yaml = ( plen > 5 && ::strcmp( &path[ plen - 5 ], ".yaml" ) == 0 ) ||
+                 ( plen > 4 && ::strcmp( &path[ plen - 4 ], ".yml" ) == 0 );
+  MDMsgMem        mem;
+  JsonParser      parser( mem );
+  JsonStreamInput input( fd );
+  int status = is_yaml ? parser.parse_yaml( input ) : parser.parse( input );
+  ::close( fd );
+  if ( status != 0 || parser.value == NULL ) {
+    fprintf( stderr, "%s: parse error %d line %u\n", path, status,
+             (unsigned) input.line_count + 1 );
+    return false;
+  }
+  JsonValue * root = parser.value;
+  if ( root->type == JSON_OBJECT ) {
+    JsonValue * n = root->to_obj()->find( "nets" );
+    if ( n == NULL ) {
+      fprintf( stderr, "%s: no \"nets\" array\n", path );
+      return false;
+    }
+    root = n;
+  }
+  if ( root->type != JSON_ARRAY ) {
+    fprintf( stderr, "%s: nets config is not an array\n", path );
+    return false;
+  }
+  JsonArray * arr = root->to_arr();
+  for ( size_t i = 0; i < arr->length; i++ ) {
+    if ( arr->val[ i ]->type != JSON_OBJECT ) {
+      fprintf( stderr, "%s: nets[%zu] is not an object\n", path, i );
+      return false;
+    }
+    JsonObject * o = arr->val[ i ]->to_obj();
+    NetDef       nd;
+    int64_t      idx = 0;
+    JsonValue  * iv = o->find( "index" );
+    if ( iv == NULL || iv->to_int( idx ) != 0 || idx < 1 ||
+         idx > (int64_t) MAX_NETS ) {
+      fprintf( stderr, "%s: nets[%zu] needs \"index\" 1..%u\n", path, i,
+               MAX_NETS );
+      return false;
+    }
+    const char * role  = json_str( o, "role" ),
+               * proto = json_str( o, "proto" );
+    nd.idx = (uint32_t) idx;
+    if ( ! parse_role_proto( nd, role, proto ) ) {
+      fprintf( stderr, "%s: nets[%zu] bad role/proto\n", path, i );
+      return false;
+    }
+    nd.parm.daemon  = json_str( o, "daemon" );
+    nd.parm.network = json_str( o, "network" );
+    nd.parm.service = json_str( o, "service" );
+    cfg.nets.push( nd );
+  }
+  return true;
 }
 
 int
@@ -846,10 +983,7 @@ main( int argc,  const char *argv[] )
   const char * daemon = get_arg( x, argc, argv, 1, "-d", "tcp:7500" ),
              * network= get_arg( x, argc, argv, 1, "-n", "" ),
              * service= get_arg( x, argc, argv, 1, "-s", "7500" ),
-             * o1     = get_arg( x, argc, argv, 1, "-1", NULL ),
-             * o2     = get_arg( x, argc, argv, 1, "-2", NULL ),
-             * o3     = get_arg( x, argc, argv, 1, "-3", NULL ),
-             * o4     = get_arg( x, argc, argv, 1, "-4", NULL ),
+             * cfile  = get_arg( x, argc, argv, 1, "-c", NULL ),
              * sfeed  = get_arg( x, argc, argv, 1, "-S", NULL ),
              * fname  = get_arg( x, argc, argv, 1, "-F", NULL ),
              * hold   = get_arg( x, argc, argv, 1, "-D", NULL ),
@@ -865,28 +999,88 @@ main( int argc,  const char *argv[] )
 
   if ( help != NULL ) {
     fprintf( stderr,
-      "rv_cache [-d daemon] [-n network] [-s service] (defaults for 4 nets)\n"
-      "  [-1 d,n,s] rv feed   [-2 d,n,s] sass2 sub network\n"
-      "  [-3 d,n,s] sass3 feed [-4 d,n,s] sass3 sub network\n"
-      "  (no -4: net 2 carries both interest channels on one submgr;\n"
-      "   with -4: net 2 = sass2-only submgr, net 4 = sass3-only submgr)\n"
+      "rv_cache [-d daemon] [-n network] [-s service] (defaults for nets)\n"
+      "  [-<idx> role,proto[,daemon[,network[,service]]]] net attachment,\n"
+      "    repeatable: idx 1..%u, role feed|sub, proto sass2|sass3|both;\n"
+      "    empty d/n/s fields fall back to -d/-n/-s\n"
+      "    e.g. -1 feed,sass2 -2 sub,sass2 -4 sub,sass3,tcp:7501,,7501\n"
+      "  [-c file] nets from json/yaml: [{index,role,proto,daemon,network,\n"
+      "    service},...] or { \"nets\": [...] } (.yaml/.yml parses as yaml)\n"
+      "  (no nets given: -1 feed,sass2 -2 sub,both)\n"
       "  [-w wild] interest filter (repeatable)\n"
-      "  [-S feed] SASS3 upstream (net 3)   [-F name] SASS3 downstream (net 4)\n"
+      "  [-S feed] SASS3 upstream feed (milestone 2)\n"
+      "  [-F name] SASS3 downstream service (milestone 2)\n"
       "  [-D secs] sass3 hold timer (480; no effect without -S/-F)\n"
       "  [-m] merge typeless   [-Q obs|strict|stamp]\n"
       "  [-M] route-after-merge   [-x secs] stale expiry\n"
       "  [-P secs] pending timeout (10)   [-A file] accounting jsonl (- stdout)\n"
-      "  [-q] quiet stats   [-v] verbose submgr log\n" );
+      "  [-q] quiet stats   [-v] verbose submgr log\n", MAX_NETS );
     return 1;
   }
 
   cfg.base.daemon = daemon;
   cfg.base.network = network;
   cfg.base.service = service;
-  if ( o1 ) { cfg.net_override[0] = true; parse_triple( o1, cfg.net[0] ); }
-  if ( o2 ) { cfg.net_override[1] = true; parse_triple( o2, cfg.net[1] ); }
-  if ( o3 ) { cfg.net_override[2] = true; parse_triple( o3, cfg.net[2] ); }
-  if ( o4 ) { cfg.net_override[3] = true; parse_triple( o4, cfg.net[3] ); }
+
+  /* -<idx> role,proto,d,n,s net attachments (any integer 1..MAX_NETS) */
+  for ( int i = 1; i < argc - 1; i++ ) {
+    const char * a = argv[ i ];
+    if ( a[ 0 ] != '-' || a[ 1 ] < '0' || a[ 1 ] > '9' )
+      continue;
+    char * end = NULL;
+    long   idx = ::strtol( &a[ 1 ], &end, 10 );
+    if ( *end != '\0' || idx < 1 || idx > (long) MAX_NETS ) {
+      fprintf( stderr, "bad net index: %s (1..%u)\n", a, MAX_NETS );
+      return 1;
+    }
+    NetDef nd;
+    if ( ! parse_net_tuple( (uint32_t) idx, argv[ i + 1 ], nd ) ) {
+      fprintf( stderr,
+        "bad net tuple: %s %s (want role,proto[,daemon[,network[,service]]],"
+        " role feed|sub, proto sass2|sass3|both)\n", a, argv[ i + 1 ] );
+      return 1;
+    }
+    cfg.nets.push( nd );
+    if ( x < i + 2 )
+      x = i + 2;
+  }
+  if ( cfile != NULL && ! load_nets_config( cfile, cfg ) )
+    return 1;
+  /* default topology when no nets are declared */
+  if ( cfg.nets.count == 0 ) {
+    NetDef f, s;
+    f.idx = 1; f.is_feed = true;  f.s2 = true; f.s3 = false;
+    s.idx = 2; s.is_feed = false; s.s2 = true; s.s3 = true;
+    cfg.nets.push( f );
+    cfg.nets.push( s );
+  }
+  /* validate: unique indexes, at least one sub, sass3 feeds are M2 */
+  {
+    uint64_t seen = 0;
+    bool     have_sub = false;
+    for ( size_t i = 0; i < cfg.nets.count; i++ ) {
+      NetDef &nd = cfg.nets.ptr[ i ];
+      uint64_t bit = (uint64_t) 1 << ( nd.idx - 1 );
+      if ( ( seen & bit ) != 0 ) {
+        fprintf( stderr, "duplicate net index %u\n", nd.idx );
+        return 1;
+      }
+      seen |= bit;
+      if ( nd.is_feed ) {
+        if ( nd.s3 ) {
+          fprintf( stderr, "net %u: sass3 feed (_SASS PUB consumer) not "
+                           "yet implemented (milestone 2)\n", nd.idx );
+          return 1;
+        }
+      }
+      else
+        have_sub = true;
+    }
+    if ( ! have_sub ) {
+      fprintf( stderr, "no sub network declared\n" );
+      return 1;
+    }
+  }
   cfg.sass3_feed = sfeed;
   cfg.sass3_name = fname;
   cfg.merge_default = ( mergem != NULL );
@@ -908,14 +1102,14 @@ main( int argc,  const char *argv[] )
       cfg.wildcards.push( (const char *) argv[ i + 1 ] );
   }
 
-  /* milestone 1: SASS3 attachments (nets 3/4) are not yet implemented */
+  /* milestone 1: SASS3 feed-side attachments are not yet implemented */
   if ( cfg.sass3_feed != NULL ) {
-    fprintf( stderr, "-S (SASS3 upstream, net 3) not yet implemented "
+    fprintf( stderr, "-S (SASS3 upstream feed) not yet implemented "
                      "(milestone 2)\n" );
     return 1;
   }
   if ( cfg.sass3_name != NULL ) {
-    fprintf( stderr, "-F (SASS3 downstream, net 4) not yet implemented "
+    fprintf( stderr, "-F (SASS3 downstream service) not yet implemented "
                      "(milestone 2)\n" );
     return 1;
   }
@@ -934,57 +1128,43 @@ main( int argc,  const char *argv[] )
     }
   }
 
-  /* net 1: rv feed (data consumer) */
-  const char * d1, * n1, * s1;
-  cfg.resolve( 0, d1, n1, s1 );
-  EvRvClientParameters p1( d1, n1, s1, "rv_cache_feed", 0 );
-  EvRvClient conn1( poll );
-  FeedCB feed( poll, conn1, cache );
-
-  /* net 2: rv sub (data publisher + submgr).  Without -4 this one
-   * submgr carries both interest channels (collapsed); with -4 it is
-   * sass2-only and net 4 runs the sass3-only submgr. */
-  bool separate = cfg.net_override[ 3 ];
-  const char * d2, * n2, * s2;
-  cfg.resolve( 1, d2, n2, s2 );
-  EvRvClientParameters p2( d2, n2, s2, "rv_cache_sub", 0 );
-  EvRvClient conn2( poll );
-  SubCB sub( poll, conn2, cache, "sub(net2)", true, ! separate, true );
-
-  /* net 4: sass3 sub network (separate submgr, sass3-only) */
-  const char * d4, * n4, * s4;
-  cfg.resolve( 3, d4, n4, s4 );
-  EvRvClientParameters p4( d4, n4, s4, "rv_cache_sass3", 0 );
-  EvRvClient conn4( poll );
-  SubCB sub3( poll, conn4, cache, "sass3(net4)", false, true, false );
-
-  cache.feed_conn = &conn1;
-  cache.sub_conn  = &conn2;
-  cache.sub_db    = &sub.sub_db;
-  if ( separate ) {
-    cache.sub_conn3 = &conn4;
-    cache.sub_db3   = &sub3.sub_db;
-  }
-
+  /* build every declared network attachment; heap-allocate since the
+   * count is config-driven.  process-lifetime objects, freed on exit. */
   MDOutput mout;
-  if ( cfg.verbose ) {
-    sub.sub_db.mout = &mout;
-    if ( separate )
-      sub3.sub_db.mout = &mout;
-  }
-
-  if ( ! conn1.rv_connect( p1, &feed, &feed ) ) {
-    fprintf( stderr, "Failed to connect net 1 (feed)\n" );
-    return 1;
-  }
-  if ( ! conn2.rv_connect( p2, &sub, &sub ) ) {
-    fprintf( stderr, "Failed to connect net 2 (sub)\n" );
-    return 1;
-  }
-  if ( separate ) {
-    if ( ! conn4.rv_connect( p4, &sub3, &sub3 ) ) {
-      fprintf( stderr, "Failed to connect net 4 (sass3 sub)\n" );
-      return 1;
+  bool     first_sub = true;
+  for ( size_t i = 0; i < cfg.nets.count; i++ ) {
+    NetDef     & nd = cfg.nets.ptr[ i ];
+    const char * d, * n, * s;
+    cfg.resolve( nd, d, n, s );
+    char user[ 32 ];
+    ::snprintf( user, sizeof( user ), "rv_cache_net%u", nd.idx );
+    EvRvClientParameters parm( d, n, s, ::strdup( user ), 0 );
+    /* EvConnection carries 64-byte-aligned buffers; plain malloc's 16
+     * is not enough */
+    EvRvClient * conn = new ( aligned_malloc( sizeof( EvRvClient ) ) )
+                        EvRvClient( poll );
+    if ( nd.is_feed ) {
+      FeedCB * fcb = new ( aligned_malloc( sizeof( FeedCB ) ) )
+                     FeedCB( poll, *conn, cache, nd.idx );
+      if ( ! conn->rv_connect( parm, fcb, fcb ) ) {
+        fprintf( stderr, "Failed to connect net %u (feed)\n", nd.idx );
+        return 1;
+      }
+    }
+    else {
+      SubCB * scb = new ( aligned_malloc( sizeof( SubCB ) ) )
+                    SubCB( poll, *conn, cache, nd.idx, nd.s2, nd.s3,
+                           first_sub );
+      first_sub = false;
+      cache.sub_conns[ nd.idx - 1 ] = conn;
+      cache.sub_dbs[ nd.idx - 1 ]   = &scb->sub_db;
+      cache.sub_nets |= (uint64_t) 1 << ( nd.idx - 1 );
+      if ( cfg.verbose )
+        scb->sub_db.mout = &mout;
+      if ( ! conn->rv_connect( parm, scb, scb ) ) {
+        fprintf( stderr, "Failed to connect net %u (sub)\n", nd.idx );
+        return 1;
+      }
     }
   }
 

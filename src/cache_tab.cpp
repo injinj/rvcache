@@ -216,6 +216,35 @@ CacheTab::evict( const char *subj,  size_t len ) noexcept
       e->image = NULL;
       e->image_len = 0;
     }
-    this->tab.remove( loc );
+    /* live forwarding interest survives image eviction (DROP): keep the
+     * entry so fwd_mask persists; the image is gone, so a subsequent
+     * _SNAP gets the NOT_FOUND reply as before */
+    if ( e->fwd_mask == 0 )
+      this->tab.remove( loc );
+  }
+}
+
+CacheEntry *
+CacheTab::interest_set( const char *subj,  size_t len,  uint32_t net ) noexcept
+{
+  bool is_new = false;
+  CacheEntry * e = this->upsert( subj, len, is_new );
+  if ( e != NULL )
+    e->fwd_mask |= (uint64_t) 1 << net;
+  return e;
+}
+
+void
+CacheTab::interest_clear( const char *subj,  size_t len,
+                          uint32_t net ) noexcept
+{
+  uint32_t h = kv_crc_c( subj, len, 0 );
+  RouteLoc loc;
+  CacheEntry * e = this->tab.find( h, subj, len, loc );
+  if ( e != NULL ) {
+    e->fwd_mask &= ~( (uint64_t) 1 << net );
+    /* idle: no interest anywhere and nothing cached */
+    if ( e->fwd_mask == 0 && e->image == NULL )
+      this->tab.remove( loc );
   }
 }

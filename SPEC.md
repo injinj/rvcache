@@ -279,13 +279,26 @@ struct CacheSubListener : public RvSubscriptionListener {
   forwarding gate then ORs the per-submgr refcnt checks (the same
   fall-through shape §5 describes for the net-4 sass3_db), and each
   submgr asserts and broadcasts initials on its own refcnt 0→1
-  independently. **Implemented via `-4 d,n,s`:** without `-4`, net 2's
-  single submgr carries both channels (collapsed); with `-4`, net 2
-  becomes sass2-only and net 4 runs the sass3-only submgr — the two
-  instances are the same code with only the `start_subscriptions`
-  enables differing. Downstream publishes (forwards, broadcast
-  initials, inbox replies) go to both networks; `_INBOX` replies are
-  point-to-point, so the network without the inbox drops them.
+  independently. **Implemented as arbitrary network attachments:**
+  `-<idx> role,proto[,daemon[,network[,service]]]` (idx 1..64, role
+  `feed|sub`, proto `sass2|sass3|both`, empty d/n/s fields fall back to
+  `-d/-n/-s`), or `-c file` with a json/yaml `nets` array of
+  `{index, role, proto, daemon, network, service}` objects. Any number
+  of feed and sub networks; every sub net is one `SubCB` + one submgr,
+  differing only in the `start_subscriptions` enables. Default topology
+  when nothing is declared: `-1 feed,sass2 -2 sub,both` (collapsed).
+- **Forwarding gate = per-net bitmask on the cache entry.**
+  `CacheEntry::fwd_mask` holds one forwarding bool per net (bit =
+  idx−1): a subscribe callback with `refcnt > 0` sets the net's bit, an
+  unsubscribe with `refcnt == 0` clears it. The tick path reads the
+  mask — no per-tick sub_tab lookups — and forwards **only to the nets
+  whose bit is set**. submgr still owns subscription life; the mask is
+  the materialized gate. Interest with no image yet creates an
+  imageless entry; DROP eviction frees the image but keeps the entry
+  while `fwd_mask != 0` (so interest survives instrument death); an
+  entry with mask 0 and no image is removed. Inbox replies
+  (`_SNAP`/miss/initial-on-listen) and per-net broadcasts (asserted
+  initials, NOSUBSCRIBERS) go to the requesting/closing net only.
 - **Asserted interest → broadcast an initial.** When rv_cache discovers
   interest it did not see arrive — a sass2 subscription-query reply
   (`Start.is_listen_start == false`, no inbox) or a sass3 RESUBSCRIBE

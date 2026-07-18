@@ -25,12 +25,26 @@ struct NetParm {
   NetParm() : daemon( 0 ), network( 0 ), service( 0 ) {}
 };
 
+static const uint32_t MAX_NETS = 64; /* fwd_mask is 64 bits */
+
+/* one network attachment: -<idx> role,proto[,daemon[,network[,service]]]
+ * or an entry in the -c json/yaml nets array.  mask bit = idx - 1 */
+struct NetDef {
+  uint32_t idx;      /* CLI integer, 1 .. MAX_NETS */
+  bool     is_feed,  /* feed | sub */
+           s2,       /* sass2: feed = _TIC broadcast consumer;
+                      *        sub  = _RV.INFO advisories + _SNAP */
+           s3;       /* sass3: feed = _SASS PUB consumer (-S, milestone 2);
+                      *        sub  = _SASS.<feed>.SUB wildcard interest */
+  NetParm  parm;
+  NetDef() : idx( 0 ), is_feed( false ), s2( false ), s3( false ) {}
+};
+
 struct Config {
   NetParm      base;             /* -d -n -s */
-  NetParm      net[ 4 ];         /* -1 .. -4 overrides (0 == feed, 1 == sub) */
-  bool         net_override[ 4 ];
-  const char * sass3_feed;       /* -S <feed>  (net 3) */
-  const char * sass3_name;       /* -F <name>  (net 4) */
+  rai::kv::ArrayCount< NetDef, 8 > nets; /* -<idx> tuples / -c file */
+  const char * sass3_feed;       /* -S <feed>  (feed-side sass3) */
+  const char * sass3_name;       /* -F <name>  (downstream service) */
   rai::kv::ArrayCount< const char *, 4 > wildcards; /* -w (repeatable) */
   uint32_t     hold_secs;        /* -D  SASS3 hold timer, sass3 nets only
                                   *     (internal to sass3_db / -S reassert;
@@ -48,17 +62,13 @@ struct Config {
              merge_default( false ), seq( SEQ_OBSERVE ),
              route_after_merge( false ),
              stale_secs( 0 ), pending_secs( 10 ), acct_file( 0 ),
-             quiet( false ), verbose( false ) {
-    for ( int i = 0; i < 4; i++ )
-      this->net_override[ i ] = false;
-  }
-  /* resolve attachment i (0..3) to a (d,n,s) triple, base filling gaps */
-  void resolve( int i,  const char *&d,  const char *&n,
+             quiet( false ), verbose( false ) {}
+  /* resolve a net's (d,n,s) triple, base filling gaps */
+  void resolve( const NetDef &nd,  const char *&d,  const char *&n,
                 const char *&s ) const {
-    const NetParm &o = this->net[ i ];
-    d = this->net_override[ i ] && o.daemon  ? o.daemon  : this->base.daemon;
-    n = this->net_override[ i ] && o.network ? o.network : this->base.network;
-    s = this->net_override[ i ] && o.service ? o.service : this->base.service;
+    d = nd.parm.daemon  ? nd.parm.daemon  : this->base.daemon;
+    n = nd.parm.network ? nd.parm.network : this->base.network;
+    s = nd.parm.service ? nd.parm.service : this->base.service;
   }
 };
 
@@ -87,6 +97,9 @@ struct Stats {
 
 /* subject cache entry (raikv RouteVec Data: trailing hash/len/value[]) */
 struct CacheEntry {
+  uint64_t fwd_mask;       /* per-net forwarding bools: bit (idx-1) set by
+                            * a subscribe with refcnt > 0 on that net,
+                            * cleared by an unsubscribe with refcnt == 0 */
   uint64_t update_count,   /* ticks received for this subject */
            forward_count,  /* ticks re-published */
            snap_count;     /* snapshots served */
@@ -105,6 +118,7 @@ struct CacheEntry {
   char     value[ 2 ];
 
   void init( uint32_t sub_id ) {
+    this->fwd_mask = 0;
     this->update_count = this->forward_count = this->snap_count = 0;
     this->last_update_ns = 0;
     this->image = NULL;
@@ -133,6 +147,12 @@ struct CacheTab {
 
   CacheEntry * find( const char *subj,  size_t len ) noexcept;
   CacheEntry * upsert( const char *subj,  size_t len,  bool &is_new ) noexcept;
+  /* forwarding-interest bits (see CacheEntry::fwd_mask).  set creates the
+   * entry if needed (imageless); clear removes an idle entry (mask 0, no
+   * image).  net is the mask bit index (idx - 1). */
+  CacheEntry * interest_set( const char *subj,  size_t len,
+                             uint32_t net ) noexcept;
+  void interest_clear( const char *subj,  size_t len,  uint32_t net ) noexcept;
   /* store image bytes; normalizes MSG_TYPE to leading fixed-width uint */
   void set_image( CacheEntry &e,  const void *bytes,  size_t len,
                   uint32_t enc ) noexcept;

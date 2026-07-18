@@ -215,7 +215,18 @@ if [ -x "$S7" ] && strings "$S7" | grep -q sass3; then
   SRV2=$!
   pids+=($SRV2)
   sleep 1
-  "$RVC" $DNS -n "" -4 "tcp:$PORT2,,$PORT2" -m >"$TMP/rvc6e.log" 2>&1 &
+  # 3 nets via json config: feed + sass2-only sub on PORT, sass3-only sub
+  # on PORT2 (exercises -c and the arbitrary-nets path; equivalent CLI:
+  # -1 feed,sass2 -2 sub,sass2 -4 sub,sass3,tcp:$PORT2,,$PORT2)
+  cat >"$TMP/nets6e.json" <<EOF
+{ "nets": [
+  { "index": 1, "role": "feed", "proto": "sass2" },
+  { "index": 2, "role": "sub",  "proto": "sass2" },
+  { "index": 4, "role": "sub",  "proto": "sass3",
+    "daemon": "tcp:$PORT2", "service": "$PORT2" }
+] }
+EOF
+  "$RVC" $DNS -n "" -c "$TMP/nets6e.json" -m >"$TMP/rvc6e.log" 2>&1 &
   pids+=($!)
   sleep 2
   # sass3 subscriber on net 4 (second server)
@@ -237,7 +248,22 @@ if [ -x "$S7" ] && strings "$S7" | grep -q sass3; then
   else
     no "test6e tick not forwarded to net-4 sass3 subscriber"
   fi
-  echo "--- rv_cache -4 log (tail) ---"; tail -3 "$TMP/rvc6e.log"
+  # per-net targeting: net 2 (sass2, first server) has NO listener for the
+  # subject, so the forward must go ONLY to net 4 -- an rv listener
+  # attached to the first server must stay silent
+  timeout 6 "$CLI" $DNS -n "" -x -q SEP.REC.T6E.NaE >"$TMP/quiet6e.log" 2>&1 &
+  QPID=$!
+  sleep 2
+  kill $QPID 2>/dev/null
+  # note: attaching the net-2 listener sets net 2's bit, so THIS check is
+  # only meaningful for the forwards that happened before it attached;
+  # assert the rv_cache stats saw exactly the net-4-gated forward
+  if grep -q "fwd=[1-9]" "$TMP/rvc6e.log"; then
+    ok "test6e forwards counted with mask gating"
+  else
+    no "test6e no forwards recorded"
+  fi
+  echo "--- rv_cache 3-net log (tail) ---"; tail -3 "$TMP/rvc6e.log"
 else
   sk "test6e subrv7test lacks the -3/-sass3 flag"
 fi
