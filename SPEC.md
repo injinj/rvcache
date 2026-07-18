@@ -271,6 +271,15 @@ struct CacheSubListener : public RvSubscriptionListener {
   accepted is an implementation decision (production clients tolerate a
   duplicate initial). `S3_REFRESH` from a client asks for **another image
   to the reply inbox** (serve like SNAPSHOT/INITIAL_VALUES).
+  Both-channels-on-one-submgr is the **collapsed** deployment (one net
+  carries both interest styles, one shared refcnt per subject).
+  **Separate sass2 and sass3 networks take separate submgr instances** —
+  one configured `(all, s2=true, s3=false)`, the other
+  `(all, false, true)` — with independent sub_tabs and refcnts; the
+  forwarding gate then ORs the per-submgr refcnt checks (the same
+  fall-through shape §5 describes for the net-4 sass3_db), and each
+  submgr asserts and broadcasts initials on its own refcnt 0→1
+  independently.
 - **Asserted interest → broadcast an initial.** When rv_cache discovers
   interest it did not see arrive — a sass2 subscription-query reply
   (`Start.is_listen_start == false`, no inbox) or a sass3 RESUBSCRIBE
