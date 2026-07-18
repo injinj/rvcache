@@ -279,7 +279,13 @@ struct CacheSubListener : public RvSubscriptionListener {
   forwarding gate then ORs the per-submgr refcnt checks (the same
   fall-through shape §5 describes for the net-4 sass3_db), and each
   submgr asserts and broadcasts initials on its own refcnt 0→1
-  independently.
+  independently. **Implemented via `-4 d,n,s`:** without `-4`, net 2's
+  single submgr carries both channels (collapsed); with `-4`, net 2
+  becomes sass2-only and net 4 runs the sass3-only submgr — the two
+  instances are the same code with only the `start_subscriptions`
+  enables differing. Downstream publishes (forwards, broadcast
+  initials, inbox replies) go to both networks; `_INBOX` replies are
+  point-to-point, so the network without the inbox drops them.
 - **Asserted interest → broadcast an initial.** When rv_cache discovers
   interest it did not see arrive — a sass2 subscription-query reply
   (`Start.is_listen_start == false`, no inbox) or a sass3 RESUBSCRIBE

@@ -204,6 +204,45 @@ fi
 echo "--- miss reply (head) ---"; sed -n '1,20p' "$TMP/snap7.log"
 
 # ---------------------------------------------------------------------------
+# Test 6e (separate sass2/sass3 networks): -4 puts the sass3-only submgr on
+# its own network (second rv_server).  A sass3 subscriber on net 4 and an rv
+# listener on net 2 both gate forwarding; the sass2-only net-2 submgr must
+# NOT see sass3 interest and vice versa.
+echo; echo "### Test 6e: -4 separate sass3 network"
+PORT2=$((PORT+1))
+if [ -x "$S7" ] && strings "$S7" | grep -q sass3; then
+  "$SRV" -r "$PORT2" >"$TMP/srv2.log" 2>&1 &
+  SRV2=$!
+  pids+=($SRV2)
+  sleep 1
+  "$RVC" $DNS -n "" -4 "tcp:$PORT2,,$PORT2" -m >"$TMP/rvc6e.log" 2>&1 &
+  pids+=($!)
+  sleep 2
+  # sass3 subscriber on net 4 (second server)
+  timeout 10 stdbuf -oL "$S7" -daemon tcp:$PORT2 -service $PORT2 -nodict -3 \
+    SEP.REC.T6E.NaE >"$TMP/miss6e.log" 2>&1 &
+  pids+=($!)
+  sleep 3
+  if grep -qiE "NOT_FOUND|TRANSIENT" "$TMP/miss6e.log"; then
+    ok "test6e sass3 miss reply served on the separate net-4 network"
+  else
+    no "test6e sass3 miss reply on net 4"
+  fi
+  # feed a tick on net 1 (first server); sass3 interest on net 4 must gate
+  # forwarding, and the forward must reach the net-4 subscriber
+  "$PUB" $DNS -n "" -r -x -p 1 _TIC.SEP.REC.T6E.NaE >/dev/null 2>&1
+  sleep 2
+  if grep -q "SEP.REC.T6E.NaE" "$TMP/miss6e.log"; then
+    ok "test6e net-4 sass3 interest gates forwarding across networks"
+  else
+    no "test6e tick not forwarded to net-4 sass3 subscriber"
+  fi
+  echo "--- rv_cache -4 log (tail) ---"; tail -3 "$TMP/rvc6e.log"
+else
+  sk "test6e subrv7test lacks the -3/-sass3 flag"
+fi
+
+# ---------------------------------------------------------------------------
 echo; echo "### rv_cache final stats line"
 tail -3 "$TMP/rvc.log"
 echo; echo "### accounting jsonl (if any)"

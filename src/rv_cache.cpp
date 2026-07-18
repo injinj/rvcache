@@ -34,14 +34,16 @@ struct RvCache {
   CacheTab         cache;
   Stats            stats;
   EvRvClient     * feed_conn,   /* net 1 (upstream _TIC.>) */
-                 * sub_conn;    /* net 2 (downstream) */
-  RvSubscriptionDB * sub_db;    /* submgr on net 2 */
+                 * sub_conn,    /* net 2 (downstream, sass2) */
+                 * sub_conn3;   /* net 4 (downstream, sass3), may be NULL */
+  RvSubscriptionDB * sub_db,    /* submgr on net 2 */
+                   * sub_db3;   /* submgr on net 4 (sass3-only), or NULL */
   FILE           * acct;
   char             pubbuf[ 64 * 1024 ];
 
   RvCache( EvPoll &p,  Config &c )
-    : poll( p ), cfg( c ), feed_conn( 0 ), sub_conn( 0 ), sub_db( 0 ),
-      acct( 0 ) {}
+    : poll( p ), cfg( c ), feed_conn( 0 ), sub_conn( 0 ), sub_conn3( 0 ),
+      sub_db( 0 ), sub_db3( 0 ), acct( 0 ) {}
 
   uint32_t cur_mono( void ) const {
     return (uint32_t) ( this->poll.mono_ns / (uint64_t) 1000000000 );
@@ -133,16 +135,25 @@ parse_sass( MDMsg *m,  uint16_t &msg_type,  uint32_t &seqno,  bool &has_type,
 uint32_t
 RvCache::sub_refcnt( const char *subj,  size_t len ) noexcept
 {
-  if ( this->sub_db == NULL )
-    return 0;
-  uint32_t h = kv_crc_c( subj, len, 0 );
-  RouteLoc loc;
-  RvSubscription * s = this->sub_db->sub_tab.find( h, subj, len, loc );
   /* _SNAP-created entries exist with refcnt 0 -- not interest.
    * TODO(can-wildcard): a client wildcard listen (TEST.>) makes an entry
    * under the wildcard subject; matching concrete ticks against wildcard
    * subscriptions is not implemented yet. */
-  return s == NULL ? 0 : s->refcnt;
+  uint32_t h = kv_crc_c( subj, len, 0 ), cnt = 0;
+  RouteLoc loc;
+  if ( this->sub_db != NULL ) {
+    RvSubscription * s = this->sub_db->sub_tab.find( h, subj, len, loc );
+    if ( s != NULL )
+      cnt += s->refcnt;
+  }
+  /* separate sass3 network (net 4): independent submgr, independent
+   * refcnts; the forwarding gate ORs across the interest databases */
+  if ( this->sub_db3 != NULL ) {
+    RvSubscription * s = this->sub_db3->sub_tab.find( h, subj, len, loc );
+    if ( s != NULL )
+      cnt += s->refcnt;
+  }
+  return cnt;
 }
 
 /* stamp the delivery MSG_TYPE into the cached image in place.  set_image
@@ -192,12 +203,19 @@ RvCache::publish_msg( const char *subj,  size_t len,  const char *reply,
                       size_t reply_len,  const void *msg,  size_t msg_len,
                       uint32_t enc ) noexcept
 {
-  if ( this->sub_conn == NULL )
-    return;
   uint32_t h = kv_crc_c( subj, len, 0 );
-  EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
-                 this->sub_conn->sub_route, *this->sub_conn, h, enc );
-  this->sub_conn->publish( pub );
+  if ( this->sub_conn != NULL ) {
+    EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
+                   this->sub_conn->sub_route, *this->sub_conn, h, enc );
+    this->sub_conn->publish( pub );
+  }
+  /* separate sass3 network: same payload to net 4.  _INBOX replies are
+   * point-to-point -- the daemon without that inbox drops them. */
+  if ( this->sub_conn3 != NULL ) {
+    EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
+                   this->sub_conn3->sub_route, *this->sub_conn3, h, enc );
+    this->sub_conn3->publish( pub );
+  }
 }
 
 size_t
@@ -591,10 +609,13 @@ RvCache::print_stats( bool final_totals ) noexcept
 {
   size_t subj = this->cache.count();
   size_t holders = 0, subjects_held = 0;
-  if ( this->sub_db != NULL ) {
+  RvSubscriptionDB * dbs[ 2 ] = { this->sub_db, this->sub_db3 };
+  for ( int i = 0; i < 2; i++ ) {
+    if ( dbs[ i ] == NULL )
+      continue;
     RouteLoc loc;
-    for ( RvSubscription * s = this->sub_db->sub_tab.first( loc ); s != NULL;
-          s = this->sub_db->sub_tab.next( loc ) ) {
+    for ( RvSubscription * s = dbs[ i ]->sub_tab.first( loc ); s != NULL;
+          s = dbs[ i ]->sub_tab.next( loc ) ) {
       if ( s->refcnt != 0 && s->len > 0 && s->value[ 0 ] != '_' ) {
         subjects_held++;
         holders += s->refcnt;
@@ -623,6 +644,10 @@ RvCache::print_stats( bool final_totals ) noexcept
     printf( " | db.sub[a=%u r=%u] hosts=%u sess=%u",
       this->sub_db->subscriptions.active, this->sub_db->subscriptions.removed,
       this->sub_db->hosts.active, this->sub_db->sessions.active );
+  if ( this->sub_db3 != NULL )
+    printf( " | db3.sub[a=%u r=%u]",
+      this->sub_db3->subscriptions.active,
+      this->sub_db3->subscriptions.removed );
   printf( "\n" );
   fflush( stdout );
 }
@@ -710,34 +735,41 @@ struct FeedCB : public EvConnectionNotify, public RvClientCB {
   }
 };
 
-/* net 2 (sub / submgr) callback */
+/* nets 2/4 (sub / submgr) callback.  The sass2 and sass3 interest
+ * channels differ ONLY in the start_subscriptions() enables:
+ * collapsed (no -4): one instance, both channels on net 2;
+ * separate networks (-4): net 2 = (all, true, false) sass2-only,
+ * net 4 = (all, false, true) sass3-only, each with its own submgr. */
 struct SubCB : public EvConnectionNotify, public RvClientCB,
                public EvTimerCallback, public RvSubscriptionListener {
   EvPoll         & poll;
   EvRvClient     & client;
   RvCache        & cache;
   RvSubscriptionDB sub_db;
-  SubCB( EvPoll &p,  EvRvClient &c,  RvCache &rc )
-    : poll( p ), client( c ), cache( rc ), sub_db( c, this ) {}
+  const char     * label;   /* "sub(net2)" / "sass3(net4)" */
+  bool             s2, s3,  /* interest channels to enable */
+                   primary; /* runs the cache timer (once per process) */
+  SubCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  const char *lbl,
+         bool sass2,  bool sass3,  bool prim )
+    : poll( p ), client( c ), cache( rc ), sub_db( c, this ), label( lbl ),
+      s2( sass2 ), s3( sass3 ), primary( prim ) {}
 
   virtual void on_connect( EvSocket &conn ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
-    printf( "sub(net2) connected: %.*s\n", len, conn.peer_address.buf );
+    printf( "%s connected: %.*s\n", this->label, len,
+            conn.peer_address.buf );
     fflush( stdout );
     bool all = ( this->cache.cfg.wildcards.count == 0 );
     for ( size_t i = 0; i < this->cache.cfg.wildcards.count; i++ )
       this->sub_db.add_wildcard( this->cache.cfg.wildcards.ptr[ i ] );
-    /* both interest channels: sass2 (_RV.INFO advisories + _SNAP) and
-     * sass3 (_SASS.<feed>.SUB wildcard).  sass3-aware clients use sass3
-     * even on sass2-only networks, so a cache must listen to both. */
-    this->sub_db.start_subscriptions( all, true, true );
+    this->sub_db.start_subscriptions( all, this->s2, this->s3 );
     this->poll.timer.add_timer_seconds( *this, 1, 1, 0 );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
                             size_t errlen ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
-    printf( "sub(net2) shutdown: %.*s %.*s\n", len, conn.peer_address.buf,
-            (int) errlen, err );
+    printf( "%s shutdown: %.*s %.*s\n", this->label, len,
+            conn.peer_address.buf, (int) errlen, err );
     if ( this->poll.quit == 0 )
       this->poll.quit = 1;
   }
@@ -747,7 +779,8 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
   }
   virtual bool timer_cb( uint64_t,  uint64_t ) noexcept {
     this->sub_db.process_events();
-    this->cache.on_timer();
+    if ( this->primary )
+      this->cache.on_timer();
     return true;
   }
   virtual void on_listen_start( Start &add ) noexcept {
@@ -833,8 +866,10 @@ main( int argc,  const char *argv[] )
   if ( help != NULL ) {
     fprintf( stderr,
       "rv_cache [-d daemon] [-n network] [-s service] (defaults for 4 nets)\n"
-      "  [-1 d,n,s] rv feed   [-2 d,n,s] rv sub\n"
-      "  [-3 d,n,s] sass3 feed [-4 d,n,s] sass3 sub\n"
+      "  [-1 d,n,s] rv feed   [-2 d,n,s] sass2 sub network\n"
+      "  [-3 d,n,s] sass3 feed [-4 d,n,s] sass3 sub network\n"
+      "  (no -4: net 2 carries both interest channels on one submgr;\n"
+      "   with -4: net 2 = sass2-only submgr, net 4 = sass3-only submgr)\n"
       "  [-w wild] interest filter (repeatable)\n"
       "  [-S feed] SASS3 upstream (net 3)   [-F name] SASS3 downstream (net 4)\n"
       "  [-D secs] sass3 hold timer (480; no effect without -S/-F)\n"
@@ -906,20 +941,37 @@ main( int argc,  const char *argv[] )
   EvRvClient conn1( poll );
   FeedCB feed( poll, conn1, cache );
 
-  /* net 2: rv sub (data publisher + submgr) */
+  /* net 2: rv sub (data publisher + submgr).  Without -4 this one
+   * submgr carries both interest channels (collapsed); with -4 it is
+   * sass2-only and net 4 runs the sass3-only submgr. */
+  bool separate = cfg.net_override[ 3 ];
   const char * d2, * n2, * s2;
   cfg.resolve( 1, d2, n2, s2 );
   EvRvClientParameters p2( d2, n2, s2, "rv_cache_sub", 0 );
   EvRvClient conn2( poll );
-  SubCB sub( poll, conn2, cache );
+  SubCB sub( poll, conn2, cache, "sub(net2)", true, ! separate, true );
+
+  /* net 4: sass3 sub network (separate submgr, sass3-only) */
+  const char * d4, * n4, * s4;
+  cfg.resolve( 3, d4, n4, s4 );
+  EvRvClientParameters p4( d4, n4, s4, "rv_cache_sass3", 0 );
+  EvRvClient conn4( poll );
+  SubCB sub3( poll, conn4, cache, "sass3(net4)", false, true, false );
 
   cache.feed_conn = &conn1;
   cache.sub_conn  = &conn2;
   cache.sub_db    = &sub.sub_db;
+  if ( separate ) {
+    cache.sub_conn3 = &conn4;
+    cache.sub_db3   = &sub3.sub_db;
+  }
 
   MDOutput mout;
-  if ( cfg.verbose )
+  if ( cfg.verbose ) {
     sub.sub_db.mout = &mout;
+    if ( separate )
+      sub3.sub_db.mout = &mout;
+  }
 
   if ( ! conn1.rv_connect( p1, &feed, &feed ) ) {
     fprintf( stderr, "Failed to connect net 1 (feed)\n" );
@@ -928,6 +980,12 @@ main( int argc,  const char *argv[] )
   if ( ! conn2.rv_connect( p2, &sub, &sub ) ) {
     fprintf( stderr, "Failed to connect net 2 (sub)\n" );
     return 1;
+  }
+  if ( separate ) {
+    if ( ! conn4.rv_connect( p4, &sub3, &sub3 ) ) {
+      fprintf( stderr, "Failed to connect net 4 (sass3 sub)\n" );
+      return 1;
+    }
   }
 
   sighndl.install();
