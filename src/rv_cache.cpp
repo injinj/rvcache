@@ -724,17 +724,44 @@ struct FeedCB : public EvConnectionNotify, public RvClientCB {
   EvPoll     & poll;
   EvRvClient & client;
   RvCache    & cache;
+  const char * wildcard; /* NULL = full firehose */
   char         label[ 24 ];
-  FeedCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  uint32_t idx )
-    : poll( p ), client( c ), cache( rc ) {
+  bool         s3;       /* _SASS.<feed>.PUB consumer (milestone 2) */
+  FeedCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  uint32_t idx,
+          const char *wild,  bool sass3 )
+    : poll( p ), client( c ), cache( rc ), wildcard( wild ), s3( sass3 ) {
     ::snprintf( this->label, sizeof( this->label ), "feed(net%u)", idx );
   }
   virtual void on_connect( EvSocket &conn ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
     printf( "%s connected: %.*s\n", this->label, len,
             conn.peer_address.buf );
+    if ( this->wildcard == NULL ) {
+      fflush( stdout );
+      this->client.subscribe( "_TIC.>", 6 );
+      return;
+    }
+    /* wildcard-scoped feed: _TIC.<wild>.> (sass2), _SASS.<wild>.PUB (sass3) */
+    char   sub[ 1024 ];
+    size_t wlen = ::strlen( this->wildcard );
+    int    slen;
+    if ( this->s3 ) {
+      /* strip a trailing ".>" / ">" from the wildcard: PUB wants the
+       * bare feed name */
+      while ( wlen > 0 && ( this->wildcard[ wlen - 1 ] == '>' ||
+                            this->wildcard[ wlen - 1 ] == '.' ) )
+        wlen--;
+      slen = ::snprintf( sub, sizeof( sub ), "_SASS.%.*s.PUB",
+                         (int) wlen, this->wildcard );
+    }
+    else {
+      bool has_gt = ( wlen > 0 && this->wildcard[ wlen - 1 ] == '>' );
+      slen = ::snprintf( sub, sizeof( sub ), "_TIC.%s%s", this->wildcard,
+                         has_gt ? "" : ".>" );
+    }
+    printf( "%s subscribe: %s\n", this->label, sub );
     fflush( stdout );
-    this->client.subscribe( "_TIC.>", 6 );
+    this->client.subscribe( sub, slen );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
                             size_t errlen ) noexcept {
@@ -760,13 +787,15 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
   RvCache        & cache;
   RvSubscriptionDB sub_db;
   uint32_t         net;     /* fwd_mask bit == idx - 1 */
+  const char     * wildcard;/* per-net submgr filter (NULL = none) */
   char             label[ 24 ];
   bool             s2, s3,  /* interest channels to enable */
                    primary; /* runs the cache timer (once per process) */
   SubCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  uint32_t idx,
-         bool sass2,  bool sass3,  bool prim )
+         bool sass2,  bool sass3,  bool prim,  const char *wild )
     : poll( p ), client( c ), cache( rc ), sub_db( c, this ),
-      net( idx - 1 ), s2( sass2 ), s3( sass3 ), primary( prim ) {
+      net( idx - 1 ), wildcard( wild ), s2( sass2 ), s3( sass3 ),
+      primary( prim ) {
     ::snprintf( this->label, sizeof( this->label ), "sub(net%u%s%s)", idx,
                 sass2 ? ",s2" : "", sass3 ? ",s3" : "" );
   }
@@ -776,9 +805,12 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
     printf( "%s connected: %.*s\n", this->label, len,
             conn.peer_address.buf );
     fflush( stdout );
-    bool all = ( this->cache.cfg.wildcards.count == 0 );
+    bool all = ( this->cache.cfg.wildcards.count == 0 &&
+                 this->wildcard == NULL );
     for ( size_t i = 0; i < this->cache.cfg.wildcards.count; i++ )
       this->sub_db.add_wildcard( this->cache.cfg.wildcards.ptr[ i ] );
+    if ( this->wildcard != NULL ) /* per-net filter, sass2 and sass3 */
+      this->sub_db.add_wildcard( this->wildcard );
     this->sub_db.start_subscriptions( all, this->s2, this->s3 );
     this->poll.timer.add_timer_seconds( *this, 1, 1, 0 );
   }
@@ -871,13 +903,13 @@ parse_role_proto( NetDef &nd,  const char *role,  const char *proto ) noexcept
   return true;
 }
 
-/* parse "role,proto[,daemon[,network[,service]]]" into a NetDef */
+/* parse "role,proto[,daemon[,network[,service[,wildcard]]]]" into a NetDef */
 static bool
 parse_net_tuple( uint32_t idx,  const char *s,  NetDef &nd ) noexcept
 {
   char       * dup = ::strdup( s );
-  const char * f[ 5 ] = { NULL, NULL, NULL, NULL, NULL };
-  split_fields( dup, f, 5 );
+  const char * f[ 6 ] = { NULL, NULL, NULL, NULL, NULL, NULL };
+  split_fields( dup, f, 6 );
   nd.idx = idx;
   if ( ! parse_role_proto( nd, f[ 0 ], f[ 1 ] ) ) {
     ::free( dup );
@@ -886,13 +918,18 @@ parse_net_tuple( uint32_t idx,  const char *s,  NetDef &nd ) noexcept
   if ( f[ 2 ] != NULL ) nd.parm.daemon  = ::strdup( f[ 2 ] );
   if ( f[ 3 ] != NULL ) nd.parm.network = ::strdup( f[ 3 ] );
   if ( f[ 4 ] != NULL ) nd.parm.service = ::strdup( f[ 4 ] );
+  if ( f[ 5 ] != NULL ) nd.wildcard     = ::strdup( f[ 5 ] );
   ::free( dup );
   return true;
 }
 
 /* json/yaml nets config: an array (or { "nets": [...] }) of objects:
  * { "index": 1, "role": "feed", "proto": "sass2",
- *   "daemon": "tcp:7500", "network": "", "service": "7500" } */
+ *   "daemon": "tcp:7500", "network": "", "service": "7500",
+ *   "wildcard": "WILD" }
+ * wildcard: sub nets filter the submgr (sass2 and sass3 interest channels,
+ * start_subscriptions all=false); feed nets subscribe _TIC.<wild>.> (sass2)
+ * or _SASS.<wild>.PUB (sass3) instead of the full firehose */
 static const char *
 json_str( JsonObject *o,  const char *name ) noexcept
 {
@@ -968,6 +1005,7 @@ load_nets_config( const char *path,  Config &cfg ) noexcept
     nd.parm.daemon  = json_str( o, "daemon" );
     nd.parm.network = json_str( o, "network" );
     nd.parm.service = json_str( o, "service" );
+    nd.wildcard     = json_str( o, "wildcard" );
     cfg.nets.push( nd );
   }
   return true;
@@ -1000,14 +1038,17 @@ main( int argc,  const char *argv[] )
   if ( help != NULL ) {
     fprintf( stderr,
       "rv_cache [-d daemon] [-n network] [-s service] (defaults for nets)\n"
-      "  [-<idx> role,proto[,daemon[,network[,service]]]] net attachment,\n"
-      "    repeatable: idx 1..%u, role feed|sub, proto sass2|sass3|both;\n"
-      "    empty d/n/s fields fall back to -d/-n/-s\n"
+      "  [-<idx> role,proto[,daemon[,network[,service[,wildcard]]]]] net\n"
+      "    attachment, repeatable: idx 1..%u, role feed|sub, proto\n"
+      "    sass2|sass3|both; empty d/n/s fields fall back to -d/-n/-s\n"
       "    e.g. -1 feed,sass2 -2 sub,sass2 -4 sub,sass3,tcp:7501,,7501\n"
       "  [-c file] nets from json/yaml: [{index,role,proto,daemon,network,\n"
-      "    service},...] or { \"nets\": [...] } (.yaml/.yml parses as yaml)\n"
+      "    service,wildcard},...] or { \"nets\": [...] } (.yaml/.yml = yaml)\n"
+      "    wildcard: sub = submgr filter (sass2+sass3, subscriptions\n"
+      "    start all=false); feed = subscribe _TIC.<wild>.> (sass2) or\n"
+      "    _SASS.<wild>.PUB (sass3) instead of the firehose\n"
       "  (no nets given: -1 feed,sass2 -2 sub,both)\n"
-      "  [-w wild] interest filter (repeatable)\n"
+      "  [-w wild] interest filter, all sub nets (repeatable)\n"
       "  [-S feed] SASS3 upstream feed (milestone 2)\n"
       "  [-F name] SASS3 downstream service (milestone 2)\n"
       "  [-D secs] sass3 hold timer (480; no effect without -S/-F)\n"
@@ -1145,7 +1186,8 @@ main( int argc,  const char *argv[] )
                         EvRvClient( poll );
     if ( nd.is_feed ) {
       FeedCB * fcb = new ( aligned_malloc( sizeof( FeedCB ) ) )
-                     FeedCB( poll, *conn, cache, nd.idx );
+                     FeedCB( poll, *conn, cache, nd.idx, nd.wildcard,
+                             nd.s3 );
       if ( ! conn->rv_connect( parm, fcb, fcb ) ) {
         fprintf( stderr, "Failed to connect net %u (feed)\n", nd.idx );
         return 1;
@@ -1154,7 +1196,7 @@ main( int argc,  const char *argv[] )
     else {
       SubCB * scb = new ( aligned_malloc( sizeof( SubCB ) ) )
                     SubCB( poll, *conn, cache, nd.idx, nd.s2, nd.s3,
-                           first_sub );
+                           first_sub, nd.wildcard );
       first_sub = false;
       cache.sub_conns[ nd.idx - 1 ] = conn;
       cache.sub_dbs[ nd.idx - 1 ]   = &scb->sub_db;

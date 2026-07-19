@@ -37,7 +37,13 @@ struct NetDef {
            s3;       /* sass3: feed = _SASS PUB consumer (-S, milestone 2);
                       *        sub  = _SASS.<feed>.SUB wildcard interest */
   NetParm  parm;
-  NetDef() : idx( 0 ), is_feed( false ), s2( false ), s3( false ) {}
+  const char * wildcard; /* per-net subject filter:
+                          * sub  = submgr filter, both sass2 and sass3
+                          *        (start_subscriptions all=false);
+                          * feed = subscribe _TIC.<wild>.> (sass2) or
+                          *        _SASS.<wild>.PUB (sass3) */
+  NetDef() : idx( 0 ), is_feed( false ), s2( false ), s3( false ),
+             wildcard( 0 ) {}
 };
 
 struct Config {

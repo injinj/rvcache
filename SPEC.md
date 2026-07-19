@@ -280,10 +280,19 @@ struct CacheSubListener : public RvSubscriptionListener {
   fall-through shape §5 describes for the net-4 sass3_db), and each
   submgr asserts and broadcasts initials on its own refcnt 0→1
   independently. **Implemented as arbitrary network attachments:**
-  `-<idx> role,proto[,daemon[,network[,service]]]` (idx 1..64, role
-  `feed|sub`, proto `sass2|sass3|both`, empty d/n/s fields fall back to
-  `-d/-n/-s`), or `-c file` with a json/yaml `nets` array of
-  `{index, role, proto, daemon, network, service}` objects. Any number
+  `-<idx> role,proto[,daemon[,network[,service[,wildcard]]]]` (idx 1..64,
+  role `feed|sub`, proto `sass2|sass3|both`, empty d/n/s fields fall back
+  to `-d/-n/-s`), or `-c file` with a json/yaml `nets` array of
+  `{index, role, proto, daemon, network, service, wildcard}` objects.
+  The optional per-net `wildcard` scopes the attachment to a subject
+  space: on a **sub** net it is passed to that net's submgr as a filter
+  for both the sass2 and sass3 interest channels and subscriptions start
+  with `all=false` (`_RV.INFO...LISTEN.{START,STOP}.<wild>.>`,
+  `_SNAP.<wild>.>`, `_SASS.<wild>.SUB` instead of the firehose); on a
+  **feed** net it narrows the upstream subscription to `_TIC.<wild>.>`
+  (sass2) or `_SASS.<wild>.PUB` (sass3, milestone 2). Global `-w`
+  filters still apply to every sub net and combine with the per-net
+  wildcard. Any number
   of feed and sub networks; every sub net is one `SubCB` + one submgr,
   differing only in the `start_subscriptions` enables. Default topology
   when nothing is declared: `-1 feed,sass2 -2 sub,both` (collapsed).
