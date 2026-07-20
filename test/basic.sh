@@ -269,6 +269,49 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 6f (sass3 feed): rv_cache consumes the _SASS.<feed>.PUB broadcast
+# envelope { M:23177, T:MSG_TYPE, D:{ subject : opaque } } on a feed,sass3
+# net.  replayrv -3 is the feed simulator.  The envelope T overrides the
+# payload MSG_TYPE; records forward to rv listeners on the bare subject.
+echo; echo "### Test 6f: sass3 feed (_SASS.<feed>.PUB envelope consumer)"
+REPLAY="$SASS/replayrv"
+if [ -x "$REPLAY" ]; then
+  "$RVC" $DNS -n "" -1 feed,sass3 -2 sub,sass2 >"$TMP/rvc6f.log" 2>&1 &
+  pids+=($!)
+  sleep 2
+  timeout 12 stdbuf -oL "$CLI" $DNS -n "" -x F3.REC.T6F >"$TMP/cli6f.log" 2>&1 &
+  pids+=($!)
+  sleep 2
+  python3 - <<'PYEOF' >"$TMP/cap6f.replay"
+import sys
+for i in range(4):
+    t = 8 if i == 0 else 1
+    m = '{"MSG_TYPE":%d,"SEQ_NO":%d,"BID":%d}' % (t, i, 100 + i)
+    sys.stdout.write("F3.REC.T6F\n%d\n%s" % (len(m), m))
+PYEOF
+  "$REPLAY" $DNS -n "" -f "$TMP/cap6f.replay" -m 20 -3 >/dev/null 2>&1
+  sleep 2
+  if grep -q "INITIAL" "$TMP/cli6f.log" && grep -q "UPDATE" "$TMP/cli6f.log"; then
+    ok "test6f envelope records forwarded to the rv listener"
+  else
+    no "test6f envelope records not delivered"
+  fi
+  if grep -q "BID" "$TMP/cli6f.log"; then
+    ok "test6f payload fields intact through the envelope"
+  else
+    no "test6f payload fields missing"
+  fi
+  if grep -q "in=[1-9]" "$TMP/rvc6f.log" && grep -q "fwd=[1-9]" "$TMP/rvc6f.log"; then
+    ok "test6f sass3 feed counted in cache stats"
+  else
+    no "test6f no envelope ticks recorded"
+  fi
+  echo "--- rv_cache sass3-feed log (tail) ---"; tail -3 "$TMP/rvc6f.log"
+else
+  sk "test6f replayrv not built in ../sassrv"
+fi
+
+# ---------------------------------------------------------------------------
 echo; echo "### rv_cache final stats line"
 tail -3 "$TMP/rvc.log"
 echo; echo "### accounting jsonl (if any)"

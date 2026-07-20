@@ -888,6 +888,16 @@ rv_cache `-S` mode emits SUB messages byte-compatible with `onMsg()` and
 parses PUB envelopes per `doFeed()`; default `_TIC.>` mode carries bare
 RVMSG payloads with SASS `MSG_TYPE`/`SEQ_NO` fields inline instead.
 
+**Implemented (feed,sass3 nets):** the PUB-envelope consumer
+(`on_sass3_feed_msg`). Requires `M` = 23177; `T` overrides the payload's
+`MSG_TYPE` when present; each `D` field (name = data subject, value =
+opaque message bytes) enters the cache through the same `handle_tic`
+path as `_TIC.>` ticks. `S`/`I`/`A`/`G`/`E` are ignored for now.
+Subscribes `_SASS.<wild>.PUB` with a net wildcard, else `_SASS.>`
+filtered on the `.PUB` suffix. The `-S` upstream subscription-maintenance
+side (batch SUB / lease reassert) remains milestone 2; `sassrv replayrv
+-3` is the envelope feed simulator (test 6f).
+
 ## Production reference: raicache `source-sass3`
 
 `~/injinj/cache.dtd` (≈ lines 1472–1500) documents the full production

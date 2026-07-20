@@ -12,6 +12,7 @@
 #include <raimd/md_dict.h>
 #include <raimd/rv_msg.h>
 #include <raimd/sass.h>
+#include <raimd/md_field_iter.h>
 #include <raikv/ev_publish.h>
 #include <raikv/key_hash.h>
 
@@ -20,6 +21,9 @@ using namespace kv;
 using namespace md;
 using namespace sassrv;
 using namespace rvcache;
+
+/* SASS3 feed broadcast envelope magic (sass_const.h SASS3_PUB_MAGIC) */
+static const uint16_t SASS3_PUB_MAGIC = 23177;
 
 /* SASS3 QueryFlags (cache_if.h), parsed from _SNAP flags field */
 enum QueryFlags {
@@ -59,8 +63,11 @@ struct RvCache {
 
   /* feed path (net 1) */
   void on_feed_msg( EvPublish &pub ) noexcept;
+  void on_sass3_feed_msg( EvPublish &pub ) noexcept;
   void handle_tic( const char *subj,  size_t len,  const void *msg,
-                   size_t msg_len,  uint32_t enc ) noexcept;
+                   size_t msg_len,  uint32_t enc,
+                   bool has_type_ovr = false,
+                   uint16_t type_ovr = 0 ) noexcept;
   /* interest (submgr callbacks; net = mask bit of the sub network) */
   void on_listen_start( RvSubscriptionListener::Start &add,
                         uint32_t net ) noexcept;
@@ -251,9 +258,53 @@ RvCache::on_feed_msg( EvPublish &pub ) noexcept
   this->handle_tic( subj + 5, len - 5, pub.msg, pub.msg_len, pub.msg_enc );
 }
 
+/* sass3 feed path: _SASS.<feed>.PUB broadcast envelope (Sass3Svc::doFeed
+ * shape):  { M : 23177, T : MSG_TYPE, D : { <subject> : <opaque msg>
+ * [, <subject> : <opaque msg> ] } }.  T overrides the payload's MSG_TYPE
+ * when present; S, I, A, G, E are ignored for now. */
+void
+RvCache::on_sass3_feed_msg( EvPublish &pub ) noexcept
+{
+  const char * subj = pub.subject;
+  size_t       len  = pub.subject_len;
+  if ( len <= 10 || ::memcmp( subj, "_SASS.", 6 ) != 0 ||
+       ::memcmp( &subj[ len - 4 ], ".PUB", 4 ) != 0 )
+    return;
+  MDMsgMem mem;
+  MDMsg  * m = MDMsg::unpack( (void *) pub.msg, 0, pub.msg_len, pub.msg_enc,
+                              NULL, mem );
+  if ( m == NULL )
+    return;
+  MDFieldReader rd( *m );
+  uint16_t      magic = 0;
+  if ( ! rd.find( "M", 2 ) || ! rd.get_uint( magic ) ||
+       magic != SASS3_PUB_MAGIC )
+    return;
+  uint16_t type_ovr = 0;
+  bool     has_ovr  = false;
+  if ( rd.find( "T", 2 ) && rd.get_uint( type_ovr ) )
+    has_ovr = true;
+  MDMsg * d = NULL;
+  if ( ! rd.find( "D", 2 ) || ! rd.get_sub_msg( d ) || d == NULL )
+    return;
+  /* each D field: name = data subject, value = opaque message bytes */
+  MDFieldReader dr( *d );
+  MDName        n;
+  for ( bool b = dr.first( n ); b; b = dr.next( n ) ) {
+    void * data;
+    size_t dlen,
+           slen = n.fnamelen;
+    while ( slen > 0 && n.fname[ slen - 1 ] == '\0' )
+      slen--;
+    if ( slen > 0 && dr.get_opaque( data, dlen ) )
+      this->handle_tic( n.fname, slen, data, dlen, 0, has_ovr, type_ovr );
+  }
+}
+
 void
 RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
-                     size_t msg_len,  uint32_t enc ) noexcept
+                     size_t msg_len,  uint32_t enc,
+                     bool has_type_ovr,  uint16_t type_ovr ) noexcept
 {
   this->stats.ticks_in++;
 
@@ -263,6 +314,10 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
   uint32_t seqno = 0;
   bool     has_type = false, has_seqno = false, has_status = false;
   parse_sass( m, msg_type, seqno, has_type, has_seqno, rec_status, has_status );
+  if ( has_type_ovr ) { /* sass3 envelope T overrides the payload MSG_TYPE */
+    msg_type = type_ovr;
+    has_type = true;
+  }
 
   /* determine effective policy when no MSG_TYPE field present */
   bool is_initial   = has_type && msg_type == MD_INITIAL_TYPE;
@@ -726,42 +781,48 @@ struct FeedCB : public EvConnectionNotify, public RvClientCB {
   RvCache    & cache;
   const char * wildcard; /* NULL = full firehose */
   char         label[ 24 ];
-  bool         s3;       /* _SASS.<feed>.PUB consumer (milestone 2) */
+  bool         s2,       /* _TIC.> tick consumer */
+               s3;       /* _SASS.<feed>.PUB envelope consumer */
   FeedCB( EvPoll &p,  EvRvClient &c,  RvCache &rc,  uint32_t idx,
-          const char *wild,  bool sass3 )
-    : poll( p ), client( c ), cache( rc ), wildcard( wild ), s3( sass3 ) {
+          const char *wild,  bool sass2,  bool sass3 )
+    : poll( p ), client( c ), cache( rc ), wildcard( wild ), s2( sass2 ),
+      s3( sass3 ) {
     ::snprintf( this->label, sizeof( this->label ), "feed(net%u)", idx );
   }
   virtual void on_connect( EvSocket &conn ) noexcept {
     int len = (int) conn.get_peer_address_strlen();
     printf( "%s connected: %.*s\n", this->label, len,
             conn.peer_address.buf );
-    if ( this->wildcard == NULL ) {
-      fflush( stdout );
-      this->client.subscribe( "_TIC.>", 6 );
-      return;
-    }
-    /* wildcard-scoped feed: _TIC.<wild>.> (sass2), _SASS.<wild>.PUB (sass3) */
     char   sub[ 1024 ];
-    size_t wlen = ::strlen( this->wildcard );
     int    slen;
-    if ( this->s3 ) {
-      /* strip a trailing ".>" / ">" from the wildcard: PUB wants the
-       * bare feed name */
-      while ( wlen > 0 && ( this->wildcard[ wlen - 1 ] == '>' ||
-                            this->wildcard[ wlen - 1 ] == '.' ) )
-        wlen--;
-      slen = ::snprintf( sub, sizeof( sub ), "_SASS.%.*s.PUB",
-                         (int) wlen, this->wildcard );
+    size_t wlen = ( this->wildcard == NULL ? 0 : ::strlen( this->wildcard ) );
+    if ( this->s2 ) { /* _TIC.> firehose or _TIC.<wild>.> */
+      if ( this->wildcard == NULL )
+        slen = ::snprintf( sub, sizeof( sub ), "_TIC.>" );
+      else {
+        bool has_gt = ( wlen > 0 && this->wildcard[ wlen - 1 ] == '>' );
+        slen = ::snprintf( sub, sizeof( sub ), "_TIC.%s%s", this->wildcard,
+                           has_gt ? "" : ".>" );
+      }
+      printf( "%s subscribe: %s\n", this->label, sub );
+      this->client.subscribe( sub, slen );
     }
-    else {
-      bool has_gt = ( wlen > 0 && this->wildcard[ wlen - 1 ] == '>' );
-      slen = ::snprintf( sub, sizeof( sub ), "_TIC.%s%s", this->wildcard,
-                         has_gt ? "" : ".>" );
+    if ( this->s3 ) { /* _SASS.<wild>.PUB, or _SASS.> filtered on .PUB */
+      if ( this->wildcard == NULL )
+        slen = ::snprintf( sub, sizeof( sub ), "_SASS.>" );
+      else {
+        /* strip a trailing ".>" / ">" from the wildcard: PUB wants the
+         * bare feed name */
+        while ( wlen > 0 && ( this->wildcard[ wlen - 1 ] == '>' ||
+                              this->wildcard[ wlen - 1 ] == '.' ) )
+          wlen--;
+        slen = ::snprintf( sub, sizeof( sub ), "_SASS.%.*s.PUB",
+                           (int) wlen, this->wildcard );
+      }
+      printf( "%s subscribe: %s\n", this->label, sub );
+      this->client.subscribe( sub, slen );
     }
-    printf( "%s subscribe: %s\n", this->label, sub );
     fflush( stdout );
-    this->client.subscribe( sub, slen );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
                             size_t errlen ) noexcept {
@@ -772,7 +833,11 @@ struct FeedCB : public EvConnectionNotify, public RvClientCB {
       this->poll.quit = 1;
   }
   virtual bool on_rv_msg( EvPublish &pub ) noexcept {
-    this->cache.on_feed_msg( pub );
+    if ( this->s3 && pub.subject_len > 6 &&
+         ::memcmp( pub.subject, "_SASS.", 6 ) == 0 )
+      this->cache.on_sass3_feed_msg( pub );
+    else
+      this->cache.on_feed_msg( pub );
     return true;
   }
 };
@@ -1095,7 +1160,7 @@ main( int argc,  const char *argv[] )
     cfg.nets.push( f );
     cfg.nets.push( s );
   }
-  /* validate: unique indexes, at least one sub, sass3 feeds are M2 */
+  /* validate: unique indexes, at least one sub */
   {
     uint64_t seen = 0;
     bool     have_sub = false;
@@ -1107,14 +1172,7 @@ main( int argc,  const char *argv[] )
         return 1;
       }
       seen |= bit;
-      if ( nd.is_feed ) {
-        if ( nd.s3 ) {
-          fprintf( stderr, "net %u: sass3 feed (_SASS PUB consumer) not "
-                           "yet implemented (milestone 2)\n", nd.idx );
-          return 1;
-        }
-      }
-      else
+      if ( ! nd.is_feed )
         have_sub = true;
     }
     if ( ! have_sub ) {
@@ -1187,7 +1245,7 @@ main( int argc,  const char *argv[] )
     if ( nd.is_feed ) {
       FeedCB * fcb = new ( aligned_malloc( sizeof( FeedCB ) ) )
                      FeedCB( poll, *conn, cache, nd.idx, nd.wildcard,
-                             nd.s3 );
+                             nd.s2, nd.s3 );
       if ( ! conn->rv_connect( parm, fcb, fcb ) ) {
         fprintf( stderr, "Failed to connect net %u (feed)\n", nd.idx );
         return 1;

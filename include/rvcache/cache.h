@@ -34,7 +34,7 @@ struct NetDef {
   bool     is_feed,  /* feed | sub */
            s2,       /* sass2: feed = _TIC broadcast consumer;
                       *        sub  = _RV.INFO advisories + _SNAP */
-           s3;       /* sass3: feed = _SASS PUB consumer (-S, milestone 2);
+           s3;       /* sass3: feed = _SASS.<feed>.PUB envelope consumer;
                       *        sub  = _SASS.<feed>.SUB wildcard interest */
   NetParm  parm;
   const char * wildcard; /* per-net subject filter:
