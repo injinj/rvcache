@@ -22,19 +22,6 @@ using namespace md;
 using namespace sassrv;
 using namespace rvcache;
 
-/* SASS3 feed broadcast envelope magic (sass_const.h SASS3_PUB_MAGIC) */
-static const uint16_t SASS3_PUB_MAGIC = 23177;
-
-/* SASS3 QueryFlags (cache_if.h), parsed from _SNAP flags field */
-enum QueryFlags {
-  QF_SNAPSHOT       = 0x01,
-  QF_SUBSCRIBE      = 0x02,
-  QF_INITIAL_VALUES = 0x04,
-  QF_UNSUBSCRIBE    = 0x08,
-  QF_REFRESH        = 0x10,
-  QF_RESUBSCRIBE    = 0x80
-};
-
 /* ------------------------------------------------------------------ */
 struct RvCache {
   EvPoll         & poll;
