@@ -1,0 +1,49 @@
+outdir ?= rpmbuild/SRPMS
+name   := rvcache
+spec   := rpm/$(name).spec
+date   := $(shell date +"%a %b %d %Y")
+rpmdir := $(shell pwd)
+# COPR's make_srpm mock chroot is minimal and ships WITHOUT git, so every
+# $(shell git ...) below fails "command not found" -> returns EMPTY -> srctree
+# collapses to just .git -> the tarball drops sources -> %build fails. Ensure
+# git exists at PARSE time, before the := assignments expand (a recipe-time
+# install is too late). No-op wherever git is already present (local builds).
+_ensure_git := $(shell command -v git >/dev/null 2>&1 || dnf -y install git-core >/dev/null 2>&1 || yum -y install git-core >/dev/null 2>&1)
+
+git_hash    := $(shell git rev-parse --short=8 HEAD)
+major_num   := 1
+minor_num   := 1
+patch_num   := 0
+build_num   := 2
+version     := $(major_num).$(minor_num).$(patch_num)
+ver_build   := $(version)-$(build_num)
+name_ver    := $(name)-$(ver_build)
+rpm_src_dir := rpmbuild/SOURCES/$(name)-$(version)
+srctree     := .git $(shell git ls-tree HEAD | awk '$$2 != "commit" { print $$4 }')
+release     := $(shell if [ -x /bin/rpmspec ] ; then \
+                   /bin/rpmspec -q rpm/$(name).spec | head -1 | sed 's/.*999.999-99999.//' | sed 's/.src//' ; fi)
+-include build_depends.mak
+
+.PHONY: srpm
+srpm: $(outdir)/$(name_ver).$(release).src.rpm
+
+$(outdir)/$(name_ver).$(release).src.rpm: rpmbuild/SOURCES/$(name_ver).tar.gz
+	mkdir -p $(outdir)
+	/bin/rpmbuild --root $(rpmdir) -D'_topdir rpmbuild' -D'_srcrpmdir $(outdir)' -D'_sourcedir rpmbuild/SOURCES' -bs rpmbuild/SPECS/$(name).spec
+
+rpmbuild/SOURCES/$(name_ver).tar.gz:
+	mkdir -p rpmbuild/RPMS rpmbuild/SRPMS rpmbuild/BUILD rpmbuild/SOURCES rpmbuild/SPECS
+	sed -e "s/99999/$(build_num)/" \
+	    -e "s/999.999/$(version)/" \
+	    -e "s/_raikv_dep/>= $(raikv_dep)/" \
+	    -e "s/_raimd_dep/>= $(raimd_dep)/" \
+	    -e "s/_sassrv_dep/>= $(sassrv_dep)/" \
+	    -e "s/_libdecnumber_dep/>= $(libdecnumber_dep)/" \
+	    -e "s/Sat Jan 01 2000/$(date)/" < rpm/$(name).spec > rpmbuild/SPECS/$(name).spec
+	mkdir -p $(rpm_src_dir)
+	for i in $(srctree) ; do ln -sf ../../../$$i $(rpm_src_dir) ; done
+	( cd rpmbuild/SOURCES && tar chzf $(name_ver).tar.gz --exclude=".*.sw*" $(name)-$(version) && rm -r -f $(name)-$(version) )
+
+.PHONY: spec_version
+spec_version:
+	@echo "$(name)_dep := $(major_num).$(minor_num)"

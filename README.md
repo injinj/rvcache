@@ -1,4 +1,4 @@
-# rv_cache
+# rvcache
 
 RV subject cache with interest-driven tick forwarding. Sits between a
 feed side (publishers on `_TIC.<subject>`) and consumers (native RV

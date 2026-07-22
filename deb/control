@@ -1,0 +1,13 @@
+Source: rvcache
+Section: devel
+Priority: optional
+Maintainer: Chris Anderson <chris@raitechnology.com>
+Build-Depends: debhelper (>= 9), sassrv, raikv, raimd, libpcre2-dev, libdecnumber, chrpath
+Standards-Version: 3.9.5
+Homepage: https://www.github.com/raitechnology/rv_cache
+
+Package: rvcache
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: RVCACHE
+ RV caching
