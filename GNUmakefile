@@ -279,7 +279,7 @@ dist_bins: $(all_libs) $(all_dlls) $(bind)/rv_cache$(exe)
 
 .PHONY: dist_rpm
 dist_rpm: srpm
-	( cd rpmbuild && rpmbuild --define "-topdir `pwd`" -ba SPECS/rv_cache.spec )
+	( cd rpmbuild && rpmbuild --define "-topdir `pwd`" -ba SPECS/rvcache.spec )
 
 # dependencies made by 'make depend'
 -include $(dependd)/depend.make
