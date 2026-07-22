@@ -58,18 +58,7 @@ rm -rf %{buildroot}
 %files
 %defattr(-,root,root,-)
 %{_bindir}/*
-%{_prefix}/lib64/*
 %{_includedir}/*
-
-%post
-echo "%{_prefix}/lib64" > /etc/ld.so.conf.d/%{name}.conf
-/sbin/ldconfig
-
-%postun
-if [ $1 -eq 0 ] ; then
-rm -f /etc/ld.so.conf.d/%{name}.conf
-fi
-/sbin/ldconfig
 
 %changelog
 * Sat Jan 01 2000 <support@raitechnology.com>
