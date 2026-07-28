@@ -1,18 +1,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <time.h>
-#include <fcntl.h>
 #include <unistd.h>
+#include <malloc.h>
+#include <sys/resource.h>
 #include <new>
 #include <rvcache/cache.h>
-#include <raimd/json.h>
 #include <raimd/md_msg.h>
 #include <raimd/md_dict.h>
 #include <raimd/rv_msg.h>
 #include <raimd/sass.h>
 #include <raimd/md_field_iter.h>
+#include <raimd/dict_load.h>
 #include <raikv/ev_publish.h>
 #include <raikv/key_hash.h>
 
@@ -25,9 +27,12 @@ using namespace rvcache;
 /* ------------------------------------------------------------------ */
 struct RvCache {
   EvPoll         & poll;
+  EvShm          & shm;
+  MDMsgDict      & dict;
   Config         & cfg;
   CacheTab         cache;
-  Stats            stats;
+  Stats            stats,
+                   old;
   /* network attachments by mask bit (idx - 1); feeds have conns only */
   EvRvClient       * sub_conns[ MAX_NETS ];
   RvSubscriptionDB * sub_dbs[ MAX_NETS ];
@@ -35,12 +40,14 @@ struct RvCache {
   FILE             * acct;
   char               pubbuf[ 64 * 1024 ];
 
-  RvCache( EvPoll &p,  Config &c )
-    : poll( p ), cfg( c ), sub_nets( 0 ), acct( 0 ) {
+  RvCache( EvPoll &p,  EvShm &s,  MDMsgDict &d,  Config &c )
+    : poll( p ), shm( s ), dict( d ), cfg( c ), sub_nets( 0 ), acct( 0 ) {
     for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
       this->sub_conns[ i ] = NULL;
       this->sub_dbs[ i ]   = NULL;
     }
+    this->stats.log_ns = poll.now_ns;
+    this->cache.init_shm( s ); /* -m map_name: images live in raikv shm */
   }
 
   uint32_t cur_mono( void ) const {
@@ -70,7 +77,20 @@ struct RvCache {
   /* helpers */
   /* stamp MSG_TYPE (leading fixed-width int, normalized at store time)
    * directly into the cached image via MDFieldIter::update() */
-  bool stamp_msg_type( CacheEntry &e,  uint16_t msg_type ) noexcept;
+  bool stamp_msg_type( void *bytes,  size_t len,  uint32_t enc,
+                       uint16_t msg_type ) noexcept;
+  /* serve-path lookup: in shm mode another rv_cache process may have
+   * cached the subject's image, so a missing local entry doesn't mean a
+   * miss -- mint the local metadata entry and let get_image consult the
+   * map.  Tick/accounting paths keep the plain find(). */
+  CacheEntry * find_for_image( const char *subj,  size_t len ) noexcept {
+    CacheEntry * e = this->cache.find( subj, len );
+    if ( e == NULL && this->cache.shm_mode() ) {
+      bool is_new;
+      e = this->cache.upsert( subj, len, is_new );
+    }
+    return e;
+  }
   /* publish to one sub net (replies, per-net broadcasts) */
   void publish_msg( uint32_t net,  const char *subj,  size_t len,
                     const char *reply,  size_t reply_len,  const void *msg,
@@ -138,20 +158,22 @@ parse_sass( MDMsg *m,  uint16_t &msg_type,  uint32_t &seqno,  bool &has_type,
   return true;
 }
 
-/* stamp the delivery MSG_TYPE into the cached image in place.  set_image
+/* stamp the delivery MSG_TYPE into the image bytes in place.  set_image
  * normalized the field to be first + fixed-width int, so this is a
  * find-first-field + same-size/type MDFieldIter::update().  MDMsg::unpack
- * references e.image's bytes (no copy), so update() mutates the cached
- * image directly -- every send re-stamps, the stored value is dead weight.
+ * references the bytes (no copy), so update() mutates them directly --
+ * heap mode stamps the cached image (every send re-stamps, the stored
+ * value is dead weight), shm mode stamps get_image's copy-out buffer.
  * Typeless images return false and are served as-is. */
 bool
-RvCache::stamp_msg_type( CacheEntry &e,  uint16_t msg_type ) noexcept
+RvCache::stamp_msg_type( void *bytes,  size_t len,  uint32_t enc,
+                         uint16_t msg_type ) noexcept
 {
-  if ( e.image == NULL )
+  if ( bytes == NULL )
     return false;
   MDMsgMem mem;
-  MDMsg  * m = MDMsg::unpack( e.image, 0, e.image_len, e.image_enc,
-                              NULL, mem );
+  MDMsg  * m = MDMsg::unpack( bytes, 0, len, enc,
+                              this->dict.dict, mem );
   if ( m == NULL )
     return false;
   MDFieldIter * it = NULL;
@@ -192,6 +214,8 @@ RvCache::publish_msg( uint32_t net,  const char *subj,  size_t len,
   EvPublish pub( subj, len, reply, reply_len, msg, msg_len,
                  c->sub_route, *c, h, enc );
   c->publish( pub );
+  this->stats.msgs_sent++;
+  this->stats.bytes_sent += len + reply_len + msg_len;
 }
 
 void
@@ -230,7 +254,6 @@ RvCache::emit_nosubscribers( uint32_t net,  const char *subj,
                                  (uint16_t) MD_NOSUBSCRIBERS_STATUS,
                                  subj, len, buf, sizeof( buf ) );
   this->publish_msg( net, subj, len, NULL, 0, buf, n, RVMSG_TYPE_ID );
-  this->stats.nosub_sent++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -259,7 +282,7 @@ RvCache::on_sass3_feed_msg( EvPublish &pub ) noexcept
     return;
   MDMsgMem mem;
   MDMsg  * m = MDMsg::unpack( (void *) pub.msg, 0, pub.msg_len, pub.msg_enc,
-                              NULL, mem );
+                              this->dict.dict, mem );
   if ( m == NULL )
     return;
   MDFieldReader rd( *m );
@@ -293,10 +316,12 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
                      size_t msg_len,  uint32_t enc,
                      bool has_type_ovr,  uint16_t type_ovr ) noexcept
 {
-  this->stats.ticks_in++;
+  this->stats.msgs_recv++;
+  this->stats.bytes_recv += len + msg_len;
 
   MDMsgMem mem;
-  MDMsg *  m = MDMsg::unpack( (void *) msg, 0, msg_len, enc, NULL, mem );
+  MDMsg *  m = MDMsg::unpack( (void *) msg, 0, msg_len, enc, this->dict.dict,
+                              mem );
   uint16_t msg_type = 0, rec_status = 0;
   uint32_t seqno = 0;
   bool     has_type = false, has_seqno = false, has_status = false;
@@ -324,13 +349,13 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
       uint16_t last16 = (uint16_t) e->last_seqno,
                new16  = (uint16_t) seqno;
       int16_t  d      = (int16_t) ( new16 - last16 );
-      switch ( this->cfg.seq ) {
+      switch ( this->cfg.sequence_policy ) {
         case SEQ_OBSERVE:
-          if ( d < 0 ) this->stats.seq_regress++;
-          else if ( d > 1 ) this->stats.seq_gap++;
+          if ( d < 0 ) this->stats.sequence_regress++;
+          else if ( d > 1 ) this->stats.sequence_gap++;
           break;
         case SEQ_STRICT:
-          if ( d <= 0 ) { this->stats.seq_regress++; apply = false; }
+          if ( d <= 0 ) { this->stats.sequence_regress++; apply = false; }
           break;
         case SEQ_STAMP:
           break; /* ignore feed seqno for ordering */
@@ -345,13 +370,13 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
 
   if ( is_transient ) {
     /* status notification: forward, never cache */
-    this->stats.transient_pass++;
+    this->stats.msgs_transient_fwd++;
   }
   else if ( is_drop ) {
     /* instrument death: forward to listeners, evict entry */
     if ( e != NULL ) {
       this->cache.evict( subj, len );
-      this->stats.evicted++;
+      this->stats.msgs_evicted++;
     }
   }
   else if ( apply ) {
@@ -374,7 +399,7 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
         do_merge = ! is_new;              /* merge if cached, else create */
       }
       else { /* no MSG_TYPE field: -m merge, else replace */
-        do_merge = this->cfg.merge_default && ! is_new;
+        do_merge = ! this->cfg.replace_typeless_msgs && ! is_new;
       }
 
       if ( do_merge )
@@ -382,14 +407,19 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
       else
         this->cache.set_image( *ce, msg, msg_len, enc );
 
-      if ( this->cfg.seq == SEQ_STAMP ) {
+      if ( this->cfg.sequence_policy == SEQ_STAMP ) {
         ce->own_seqno++;
         ce->last_seqno = ce->own_seqno;
       }
-      if ( this->cfg.route_after_merge && ce->image != NULL ) {
-        fwd_msg = ce->image;
-        fwd_len = ce->image_len;
-        fwd_enc = ce->image_enc;
+      if ( this->cfg.route_after_merge ) {
+        void   * img;
+        size_t   img_len;
+        uint32_t img_enc;
+        if ( this->cache.get_image( *ce, img, img_len, img_enc ) ) {
+          fwd_msg = img;
+          fwd_len = img_len;
+          fwd_enc = img_enc;
+        }
       }
     }
   }
@@ -403,11 +433,11 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
   uint64_t     mask = ( fe != NULL ? fe->fwd_mask : 0 );
   if ( mask != 0 ) {
     this->publish_mask( mask, subj, len, fwd_msg, fwd_len, fwd_enc );
-    this->stats.ticks_forwarded++;
+    this->stats.msgs_forwarded++;
     fe->forward_count++;
   }
   else {
-    this->stats.dropped_no_listener++;
+    this->stats.msgs_no_listener++;
   }
 }
 
@@ -429,8 +459,10 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add,
   if ( add.sub.refcnt > 0 )
     this->cache.interest_set( subj, len, net );
   /* submgr already ref'd the subscription; refcnt 1 == subject went live */
-  if ( add.sub.refcnt == 1 )
-    this->stats.interest_opens++;
+  if ( add.sub.refcnt == 1 ) {
+    this->stats.subscription_starts++;
+    this->stats.subscriptions_active++;
+  }
   this->acct_event( "subscribe", subj, len, &add.session, proto, 0,
                     NULL, 0, 0, 0 );
 
@@ -445,20 +477,26 @@ RvCache::on_listen_start( RvSubscriptionListener::Start &add,
   /* initial-on-listen (rv5 path): the CLIENT controls this -- attaching an
    * inbox to the listen-start is the request for an initial.  No option. */
   if ( add.reply_len > 0 ) {
-    CacheEntry * e = this->cache.find( subj, len );
-    if ( e != NULL && e->image != NULL ) {
-      this->stamp_msg_type( *e, (uint16_t) MD_INITIAL_TYPE );
-      this->publish_msg( net, add.reply, add.reply_len, NULL, 0, e->image,
-                         e->image_len, e->image_enc );
+    CacheEntry * e = this->find_for_image( subj, len );
+    void   * img;
+    size_t   img_len;
+    uint32_t img_enc;
+    if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) ) {
+      this->stamp_msg_type( img, img_len, img_enc,
+                            (uint16_t) MD_INITIAL_TYPE );
+      this->publish_msg( net, add.reply, add.reply_len, NULL, 0, img,
+                         img_len, img_enc );
       e->snap_count++;
       this->acct_event( "initial", subj, len, &add.session, proto, 0,
                         NULL, 0, 0, 0 );
+      this->stats.initials_sent++;
     }
     else {
       /* miss -> status to the inbox, never silence (spec 2): the
        * requester attached an inbox precisely to learn the subject's
        * state.  Interest stays registered; a later INITIAL broadcasts. */
       this->serve_miss( net, subj, len, add.reply, add.reply_len );
+      this->stats.initials_not_found++;
     }
   }
 }
@@ -489,7 +527,8 @@ RvCache::on_listen_stop( RvSubscriptionListener::Stop &rem,
    * clear the forwarding bit */
   if ( rem.sub.refcnt == 0 ) {
     this->cache.interest_clear( subj, len, net );
-    this->stats.interest_closes++;
+    this->stats.subscription_stops++;
+    this->stats.subscriptions_active--;
     this->emit_nosubscribers( net, subj, len );
   }
 }
@@ -512,18 +551,21 @@ RvCache::serve_snapshot( uint32_t net,  const char *subj,  size_t len,
 {
   if ( reply == NULL || reply_len == 0 )
     return;
-  CacheEntry * e = this->cache.find( subj, len );
-  if ( e != NULL && e->image != NULL ) {
+  CacheEntry * e = this->find_for_image( subj, len );
+  void   * img;
+  size_t   img_len;
+  uint32_t img_enc;
+  if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) ) {
     /* stamp for the delivery kind: INITIAL when the requester is
      * subscribing (INITIAL_VALUES), SNAPSHOT for a plain image poll */
     bool         is_initial = ( flags & QF_INITIAL_VALUES ) != 0;
     const char * event      = is_initial ? "initial" : "snapshot";
-    this->stamp_msg_type( *e, (uint16_t)
+    this->stamp_msg_type( img, img_len, img_enc, (uint16_t)
                           ( is_initial ? MD_INITIAL_TYPE : MD_SNAPSHOT_TYPE ) );
-    this->publish_msg( net, reply, reply_len, NULL, 0, e->image,
-                       e->image_len, e->image_enc );
+    this->publish_msg( net, reply, reply_len, NULL, 0, img,
+                       img_len, img_enc );
     e->snap_count++;
-    this->stats.snaps_served++;
+    this->stats.snaps_sent++;
     this->acct_event( event, subj, len, sess,
                       s3 != NULL ? "sass3" : "snap", flags,
                       NULL, 0, 0, 0, s3 );
@@ -531,6 +573,7 @@ RvCache::serve_snapshot( uint32_t net,  const char *subj,  size_t len,
   else {
     /* broadcast-feed miss: TRANSIENT / NOT_FOUND immediately (bcast-nack) */
     this->serve_miss( net, subj, len, reply, reply_len );
+    this->stats.snaps_not_found++;
   }
 }
 
@@ -543,7 +586,6 @@ RvCache::serve_miss( uint32_t net,  const char *subj,  size_t len,
                                  (uint16_t) MD_NOT_FOUND_STATUS,
                                  subj, len, buf, sizeof( buf ) );
   this->publish_msg( net, reply, reply_len, NULL, 0, buf, n, RVMSG_TYPE_ID );
-  this->stats.snaps_missed++;
 }
 
 void
@@ -552,12 +594,14 @@ RvCache::broadcast_initial( uint32_t net,  const char *subj,  size_t len,
                             const RvSass3Entry *s3,
                             const char *proto ) noexcept
 {
-  CacheEntry * e = this->cache.find( subj, len );
-  if ( e == NULL || e->image == NULL )
+  CacheEntry * e = this->find_for_image( subj, len );
+  void   * img;
+  size_t   img_len;
+  uint32_t img_enc;
+  if ( e == NULL || ! this->cache.get_image( *e, img, img_len, img_enc ) )
     return; /* cold: the feed's next INITIAL broadcasts normally */
-  this->stamp_msg_type( *e, (uint16_t) MD_INITIAL_TYPE );
-  this->publish_msg( net, subj, len, NULL, 0, e->image, e->image_len,
-                     e->image_enc );
+  this->stamp_msg_type( img, img_len, img_enc, (uint16_t) MD_INITIAL_TYPE );
+  this->publish_msg( net, subj, len, NULL, 0, img, img_len, img_enc );
   e->snap_count++;
   this->acct_event( "initial", subj, len, sess, proto, 0,
                     NULL, 0, 0, 0, s3 );
@@ -594,7 +638,8 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3,
      * clear the forwarding bit */
     if ( sa3.sub.refcnt == 0 ) {
       this->cache.interest_clear( subj, len, net );
-      this->stats.interest_closes++;
+      this->stats.subscription_stops++;
+      this->stats.subscriptions_active--;
       this->emit_nosubscribers( net, subj, len );
     }
     return;
@@ -605,8 +650,10 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3,
   if ( ( sa3.flags & QF_SUBSCRIBE ) != 0 || sa3.is_asserted ) {
     if ( sa3.sub.refcnt > 0 )
       this->cache.interest_set( subj, len, net );
-    if ( sa3.sub.refcnt == 1 )
-      this->stats.interest_opens++;
+    if ( sa3.sub.refcnt == 1 ) {
+      this->stats.subscription_starts++;
+      this->stats.subscriptions_active++;
+    }
     this->acct_event( "subscribe", subj, len, NULL, "sass3", sa3.flags,
                       NULL, 0, 0, 0, &sa3.sass3 );
   }
@@ -634,10 +681,10 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3,
 void
 RvCache::on_timer( void ) noexcept
 {
-  /* stale cache entry expiry */
-  if ( this->cfg.stale_secs > 0 ) {
+  /* eviction cache entry expiry */
+  if ( this->cfg.message_eviction_secs > 0 ) {
     uint64_t cutoff = this->now_ns() -
-                      (uint64_t) this->cfg.stale_secs * 1000000000ULL;
+                      (uint64_t) this->cfg.message_eviction_secs * 1000000000ULL;
     RouteLoc loc;
     for ( CacheEntry * e = this->cache.tab.first( loc ); e != NULL; ) {
       if ( e->last_update_ns != 0 && e->last_update_ns < cutoff ) {
@@ -646,7 +693,7 @@ RvCache::on_timer( void ) noexcept
         ::memcpy( tmp, e->value, l );
         CacheEntry * nxt = this->cache.tab.next( loc );
         this->cache.evict( tmp, l );
-        this->stats.evicted++;
+        this->stats.msgs_evicted++;
         e = nxt;
         continue;
       }
@@ -661,39 +708,111 @@ RvCache::on_timer( void ) noexcept
 void
 RvCache::print_stats( bool final_totals ) noexcept
 {
+#if 0
   size_t subj = this->cache.count();
-  size_t holders = 0, subjects_held = 0;
-  for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
-    RvSubscriptionDB * db = this->sub_dbs[ i ];
-    if ( db == NULL )
-      continue;
-    RouteLoc loc;
-    for ( RvSubscription * s = db->sub_tab.first( loc ); s != NULL;
-          s = db->sub_tab.next( loc ) ) {
-      if ( s->refcnt != 0 && s->len > 0 && s->value[ 0 ] != '_' ) {
-        subjects_held++;
-        holders += s->refcnt;
-      }
-    }
-  }
   printf( "%s cached=%zu img=%lluB held=%zu holders=%zu | "
           "in=%llu fwd=%llu drop=%llu | snap=%llu/%llu | "
           "open=%llu close=%llu evict=%llu nosub=%llu | seq[reg=%llu gap=%llu] "
           "tr=%llu",
-    final_totals ? "TOTALS" : "stats",
-    subj, (unsigned long long) this->cache.image_bytes, subjects_held, holders,
-    (unsigned long long) this->stats.ticks_in,
-    (unsigned long long) this->stats.ticks_forwarded,
-    (unsigned long long) this->stats.dropped_no_listener,
-    (unsigned long long) this->stats.snaps_served,
-    (unsigned long long) this->stats.snaps_missed,
-    (unsigned long long) this->stats.interest_opens,
-    (unsigned long long) this->stats.interest_closes,
-    (unsigned long long) this->stats.evicted,
-    (unsigned long long) this->stats.nosub_sent,
-    (unsigned long long) this->stats.seq_regress,
-    (unsigned long long) this->stats.seq_gap,
-    (unsigned long long) this->stats.transient_pass );
+#endif
+  Stats & cur = this->stats, & old = this->old;
+  uint64_t diff_ns = this->poll.now_ns - cur.log_ns;
+  if ( ! final_totals ) {
+    if ( this->poll.now_ns < cur.log_ns ) {
+      cur.log_ns = this->poll.now_ns;
+      return;
+    }
+    if ( diff_ns < 10e9 )
+      return;
+    old.log_ns = cur.log_ns;
+    cur.log_ns = this->poll.now_ns;
+  }
+  uint64_t cache_cnt = 0, cache_byt = 0, mem_info = 0,
+           msgs_recv = 0, msgs_sent = 0, bytes_recv = 0, bytes_sent = 0,
+           msgs_fwd = 0, msgs_trans = 0, msgs_norte = 0, ini_sent = 0,
+           ini_notfd = 0, snap_sent = 0, snap_notf = 0, sub_count = 0,
+           sub_start = 0, sub_stop = 0, msgs_evict = 0, seq_regre = 0,
+           seq_gap = 0, user_cpu_us = 0, sys_cpu_us = 0;
+  bool b = false;
+  size_t n = 0;
+  char hdr[ 3 ][ 80 ], sta[ 3 ][ 80 ], mbuf[ 16 ];
+
+  this->stats.cache_msg_count = this->cache.tab.pop_count();
+  this->stats.cache_msg_bytes = this->cache.image_bytes;
+
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  struct mallinfo2 mi = mallinfo2();
+#else
+  struct mallinfo mi = mallinfo();
+#endif
+  this->stats.heap_mem_info = mi.arena;
+  struct rusage ru;
+  ::getrusage( RUSAGE_SELF, &ru );
+  this->stats.user_cpu_usecs = ru.ru_utime.tv_sec * 1e6 + ru.ru_utime.tv_usec;
+  this->stats.sys_cpu_usecs  = ru.ru_stime.tv_sec * 1e6 + ru.ru_stime.tv_usec;
+
+#define P( S, X ) if ( final_totals ) { X = cur.S; b = true; } else if ( cur.S > old.S ) { X = cur.S - old.S; old.S = cur.S; b = true; }
+#define T( S, X ) if ( (X = cur.S) != old.S ) { old.S = cur.S; b = true; }
+#define S( F ) ::snprintf( &hdr[ n ][ o ], 80 - o, "%11s", #F )
+#define X( F ) S( F ); ::snprintf( &sta[ n ][ o ], 80 - o, "%11lld", (long long) F ); o += 11
+#define F( F ) S( F ); ::snprintf( &sta[ n ][ o ], 80 - o, "%11.3f", F ); o += 11
+#define K( F ) S( F ); ::snprintf( &sta[ n ][ o ], 80 - o, "%11s", mem_to_string( F, mbuf, 1024 ) ); o += 11
+  P( msgs_recv, msgs_recv );
+  P( msgs_sent, msgs_sent );
+  P( bytes_recv, bytes_recv );
+  P( bytes_sent, bytes_sent );
+  P( msgs_forwarded, msgs_fwd );
+  P( msgs_transient_fwd, msgs_trans );
+  P( msgs_no_listener, msgs_norte );
+  if ( b || final_totals ) {
+    size_t o = 0;
+    X( msgs_recv ); X( msgs_sent ); K( bytes_recv ); K( bytes_sent ); X( msgs_fwd ); X( msgs_trans ); X( msgs_norte ); n++; b = false;
+  }
+  P( initials_sent, ini_sent );
+  P( initials_not_found, ini_notfd );
+  P( snaps_sent, snap_sent );
+  P( snaps_not_found, snap_notf );
+  P( subscription_starts, sub_start );
+  P( subscription_stops, sub_stop );
+  P( sequence_regress, seq_regre );
+  P( sequence_gap, seq_gap );
+  seq_gap += seq_regre;
+  if ( b || final_totals ) {
+    size_t o = 0;
+    X( ini_sent ); X( ini_notfd ); X( snap_sent ); X( snap_notf ); X( sub_start ); X( sub_stop ); X( seq_gap ); n++; b = false;
+  }
+
+  T( cache_msg_count, cache_cnt );
+  T( cache_msg_bytes, cache_byt );
+  T( heap_mem_info, mem_info );
+  P( user_cpu_usecs, user_cpu_us );
+  P( sys_cpu_usecs, sys_cpu_us );
+  T( subscriptions_active, sub_count );
+  P( msgs_evicted, msgs_evict );
+  double diff_us = diff_ns / 1000.0;
+  if ( b || final_totals ) {
+    size_t o = 0;
+    double user_cpu = (double) user_cpu_us * 100.0 / diff_us,
+           sys_cpu  = (double) sys_cpu_us * 100.0  / diff_us;
+    X( cache_cnt ); K( cache_byt ); K( mem_info ); F( user_cpu ); F( sys_cpu ); X( sub_count ); X( msgs_evict ); n++; b = false;
+  }
+#undef P
+#undef T
+#undef S
+#undef X
+#undef F
+#undef K
+  if ( n != 0 ) {
+    char sbuf[ 64 ];
+    fprintf( stdout, "%s %s interval %.3fs:\n", timestamp( this->poll.now_ns, 3, sbuf, sizeof( sbuf ) ), final_totals ? "Final" : "Stats",
+             diff_us / 1000000.0 );
+    for ( size_t i = 0; i < n; i++ ) {
+      fputs( hdr[ i ], stdout ); fputs( "\n", stdout ); fputs( sta[ i ], stdout ); fputs( "\n", stdout );
+    }
+    printf( "\n" );
+    fflush( stdout );
+  }
+#if 0
   for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
     RvSubscriptionDB * db = this->sub_dbs[ i ];
     if ( db != NULL )
@@ -701,8 +820,7 @@ RvCache::print_stats( bool final_totals ) noexcept
         db->subscriptions.active, db->subscriptions.removed,
         db->hosts.active, db->sessions.active );
   }
-  printf( "\n" );
-  fflush( stdout );
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -857,14 +975,11 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
     printf( "%s connected: %.*s\n", this->label, len,
             conn.peer_address.buf );
     fflush( stdout );
-    bool all = ( this->cache.cfg.wildcards.count == 0 &&
-                 this->wildcard == NULL );
-    for ( size_t i = 0; i < this->cache.cfg.wildcards.count; i++ )
-      this->sub_db.add_wildcard( this->cache.cfg.wildcards.ptr[ i ] );
+    bool all = ( this->wildcard == NULL );
     if ( this->wildcard != NULL ) /* per-net filter, sass2 and sass3 */
       this->sub_db.add_wildcard( this->wildcard );
     this->sub_db.start_subscriptions( all, this->s2, this->s3 );
-    this->poll.timer.add_timer_seconds( *this, 1, 1, 0 );
+    this->poll.timer.add_timer_millis( *this, 1000, 1, 0 );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
                             size_t errlen ) noexcept {
@@ -913,156 +1028,6 @@ get_arg( int &x,  int argc,  const char *argv[],  int b,  const char *f,
   return def;
 }
 
-/* split s on ',' into up to n fields (empty fields -> NULL); modifies s */
-static int
-split_fields( char *s,  const char *f[],  int n ) noexcept
-{
-  int cnt = 0;
-  while ( cnt < n ) {
-    f[ cnt++ ] = ( *s != '\0' && *s != ',' ) ? s : NULL;
-    char * c = ::strchr( s, ',' );
-    if ( c == NULL )
-      break;
-    *c = '\0';
-    s = c + 1;
-  }
-  return cnt;
-}
-
-static bool
-parse_role_proto( NetDef &nd,  const char *role,  const char *proto ) noexcept
-{
-  if ( role == NULL )
-    return false;
-  if ( ::strcmp( role, "feed" ) == 0 )
-    nd.is_feed = true;
-  else if ( ::strcmp( role, "sub" ) == 0 )
-    nd.is_feed = false;
-  else
-    return false;
-  if ( proto == NULL || ::strcmp( proto, "both" ) == 0 ||
-       ::strcmp( proto, "sass2+sass3" ) == 0 ) {
-    nd.s2 = true; nd.s3 = true;
-  }
-  else if ( ::strcmp( proto, "sass2" ) == 0 ) {
-    nd.s2 = true; nd.s3 = false;
-  }
-  else if ( ::strcmp( proto, "sass3" ) == 0 ) {
-    nd.s2 = false; nd.s3 = true;
-  }
-  else
-    return false;
-  return true;
-}
-
-/* parse "role,proto[,daemon[,network[,service[,wildcard]]]]" into a NetDef */
-static bool
-parse_net_tuple( uint32_t idx,  const char *s,  NetDef &nd ) noexcept
-{
-  char       * dup = ::strdup( s );
-  const char * f[ 6 ] = { NULL, NULL, NULL, NULL, NULL, NULL };
-  split_fields( dup, f, 6 );
-  nd.idx = idx;
-  if ( ! parse_role_proto( nd, f[ 0 ], f[ 1 ] ) ) {
-    ::free( dup );
-    return false;
-  }
-  if ( f[ 2 ] != NULL ) nd.parm.daemon  = ::strdup( f[ 2 ] );
-  if ( f[ 3 ] != NULL ) nd.parm.network = ::strdup( f[ 3 ] );
-  if ( f[ 4 ] != NULL ) nd.parm.service = ::strdup( f[ 4 ] );
-  if ( f[ 5 ] != NULL ) nd.wildcard     = ::strdup( f[ 5 ] );
-  ::free( dup );
-  return true;
-}
-
-/* json/yaml nets config: an array (or { "nets": [...] }) of objects:
- * { "index": 1, "role": "feed", "proto": "sass2",
- *   "daemon": "tcp:7500", "network": "", "service": "7500",
- *   "wildcard": "WILD" }
- * wildcard: sub nets filter the submgr (sass2 and sass3 interest channels,
- * start_subscriptions all=false); feed nets subscribe _TIC.<wild>.> (sass2)
- * or _SASS.<wild>.PUB (sass3) instead of the full firehose */
-static const char *
-json_str( JsonObject *o,  const char *name ) noexcept
-{
-  JsonValue * v = o->find( name );
-  if ( v == NULL || v->type != JSON_STRING )
-    return NULL;
-  JsonString * s = v->to_str();
-  if ( s->length == 0 )
-    return NULL;
-  char * cp = (char *) ::malloc( s->length + 1 );
-  ::memcpy( cp, s->val, s->length );
-  cp[ s->length ] = '\0';
-  return cp;
-}
-
-static bool
-load_nets_config( const char *path,  Config &cfg ) noexcept
-{
-  int fd = ::open( path, O_RDONLY );
-  if ( fd < 0 ) {
-    perror( path );
-    return false;
-  }
-  size_t plen = ::strlen( path );
-  bool is_yaml = ( plen > 5 && ::strcmp( &path[ plen - 5 ], ".yaml" ) == 0 ) ||
-                 ( plen > 4 && ::strcmp( &path[ plen - 4 ], ".yml" ) == 0 );
-  MDMsgMem        mem;
-  JsonParser      parser( mem );
-  JsonStreamInput input( fd );
-  int status = is_yaml ? parser.parse_yaml( input ) : parser.parse( input );
-  ::close( fd );
-  if ( status != 0 || parser.value == NULL ) {
-    fprintf( stderr, "%s: parse error %d line %u\n", path, status,
-             (unsigned) input.line_count + 1 );
-    return false;
-  }
-  JsonValue * root = parser.value;
-  if ( root->type == JSON_OBJECT ) {
-    JsonValue * n = root->to_obj()->find( "nets" );
-    if ( n == NULL ) {
-      fprintf( stderr, "%s: no \"nets\" array\n", path );
-      return false;
-    }
-    root = n;
-  }
-  if ( root->type != JSON_ARRAY ) {
-    fprintf( stderr, "%s: nets config is not an array\n", path );
-    return false;
-  }
-  JsonArray * arr = root->to_arr();
-  for ( size_t i = 0; i < arr->length; i++ ) {
-    if ( arr->val[ i ]->type != JSON_OBJECT ) {
-      fprintf( stderr, "%s: nets[%zu] is not an object\n", path, i );
-      return false;
-    }
-    JsonObject * o = arr->val[ i ]->to_obj();
-    NetDef       nd;
-    int64_t      idx = 0;
-    JsonValue  * iv = o->find( "index" );
-    if ( iv == NULL || iv->to_int( idx ) != 0 || idx < 1 ||
-         idx > (int64_t) MAX_NETS ) {
-      fprintf( stderr, "%s: nets[%zu] needs \"index\" 1..%u\n", path, i,
-               MAX_NETS );
-      return false;
-    }
-    const char * role  = json_str( o, "role" ),
-               * proto = json_str( o, "proto" );
-    nd.idx = (uint32_t) idx;
-    if ( ! parse_role_proto( nd, role, proto ) ) {
-      fprintf( stderr, "%s: nets[%zu] bad role/proto\n", path, i );
-      return false;
-    }
-    nd.parm.daemon  = json_str( o, "daemon" );
-    nd.parm.network = json_str( o, "network" );
-    nd.parm.service = json_str( o, "service" );
-    nd.wildcard     = json_str( o, "wildcard" );
-    cfg.nets.push( nd );
-  }
-  return true;
-}
-
 int
 main( int argc,  const char *argv[] )
 {
@@ -1070,18 +1035,17 @@ main( int argc,  const char *argv[] )
   Config cfg;
   int x = 1;
 
-  const char * daemon = get_arg( x, argc, argv, 1, "-d", "tcp:7500" ),
-             * network= get_arg( x, argc, argv, 1, "-n", "" ),
-             * service= get_arg( x, argc, argv, 1, "-s", "7500" ),
+  const char * map    = get_arg( x, argc, argv, 1, "-m", NULL ),
+             * path   = get_arg( x, argc, argv, 1, "-p", ::getenv( "cfile_path" ) ),
+             * daemon = get_arg( x, argc, argv, 1, "-d", NULL ),
+             * network= get_arg( x, argc, argv, 1, "-n", NULL ),
+             * service= get_arg( x, argc, argv, 1, "-s", NULL ),
              * cfile  = get_arg( x, argc, argv, 1, "-c", NULL ),
-             * sfeed  = get_arg( x, argc, argv, 1, "-S", NULL ),
-             * fname  = get_arg( x, argc, argv, 1, "-F", NULL ),
-             * hold   = get_arg( x, argc, argv, 1, "-D", NULL ),
              * seqm   = get_arg( x, argc, argv, 1, "-Q", NULL ),
-             * stale  = get_arg( x, argc, argv, 1, "-x", NULL ),
+             * evict  = get_arg( x, argc, argv, 1, "-x", NULL ),
              * pend   = get_arg( x, argc, argv, 1, "-P", NULL ),
              * acctf  = get_arg( x, argc, argv, 1, "-A", NULL ),
-             * mergem = get_arg( x, argc, argv, 0, "-m", NULL ),
+             * replace= get_arg( x, argc, argv, 0, "-r", NULL ),
              * routem = get_arg( x, argc, argv, 0, "-M", NULL ),
              * quiet  = get_arg( x, argc, argv, 0, "-q", NULL ),
              * verb   = get_arg( x, argc, argv, 0, "-v", NULL ),
@@ -1089,35 +1053,34 @@ main( int argc,  const char *argv[] )
 
   if ( help != NULL ) {
     fprintf( stderr,
-      "rv_cache [-d daemon] [-n network] [-s service] (defaults for nets)\n"
-      "  [-<idx> role,proto[,daemon[,network[,service[,wildcard]]]]] net\n"
-      "    attachment, repeatable: idx 1..%u, role feed|sub, proto\n"
-      "    sass2|sass3|both; empty d/n/s fields fall back to -d/-n/-s\n"
-      "    e.g. -1 feed,sass2 -2 sub,sass2 -4 sub,sass3,tcp:7501,,7501\n"
-      "  [-c file] nets from json/yaml: [{index,role,proto,daemon,network,\n"
-      "    service,wildcard},...] or { \"nets\": [...] } (.yaml/.yml = yaml)\n"
-      "    wildcard: sub = submgr filter (sass2+sass3, subscriptions\n"
-      "    start all=false); feed = subscribe _TIC.<wild>.> (sass2) or\n"
-      "    _SASS.<wild>.PUB (sass3) instead of the firehose\n"
-      "  (no nets given: -1 feed,sass2 -2 sub,both)\n"
-      "  [-w wild] interest filter, all sub nets (repeatable)\n"
-      "  [-S feed] SASS3 upstream feed (milestone 2)\n"
-      "  [-F name] SASS3 downstream service (milestone 2)\n"
-      "  [-D secs] sass3 hold timer (480; no effect without -S/-F)\n"
-      "  [-m] merge typeless   [-Q obs|strict|stamp]\n"
-      "  [-M] route-after-merge   [-x secs] stale expiry\n"
-      "  [-P secs] pending timeout (10)   [-A file] accounting jsonl (- stdout)\n"
-      "  [-q] quiet stats   [-v] verbose submgr log\n", MAX_NETS );
+      "rv_cache [-d daemon] [-n network] [-s service] (defaults)\n"
+      "  [-<idx> role proto[ daemon[ network[ service[ wildcard]]]]] net\n"
+      "  [-p path]             = dictionary search path\n"
+      "  [-c file]             = json/yaml config (.yaml/.yml = yaml)\n"
+      "  [-m map_name]         = shm name to cache msgs\n"
+      "  [-r]                  = replace typeless msgs\n"
+      "  [-Q obs|strict|stamp] = message sequence policy\n"
+      "  [-M]                  = route-after-merge\n"
+      "  [-x secs]             = eviction expiry\n"
+      "  [-P secs]             = pending timeout (10)\n"
+      "  [-A file]             = accounting jsonl (- stdout)\n"
+      "  [-q]                  = quiet stats\n"
+      "  [-v]                  = verbose submgr log\n"
+      "\n"
+      "example:\n"
+      "rv_cache -1 sub sass2 tcp:7500 'eth0;227.5.0.0' 7500 'RSF.>' \\\n"
+      "         -2 feed sass2 tcp:7600 'eth1;227.6.0.0' 7600 'RSF.>' \\\n"
+      "         -c cache.yaml \\\n"
+      "         -m sysv:raikv.shm \\\n"
+      "         -A subscript.log\n" );
     return 1;
   }
 
-  cfg.base.daemon = daemon;
-  cfg.base.network = network;
-  cfg.base.service = service;
-
-  /* -<idx> role,proto,d,n,s net attachments (any integer 1..MAX_NETS) */
+  /* -<idx> role proto [d [n [s [wild]]]] net attachments, argv-separated
+   * (network configs contain commas); fields run to the next -flag */
   for ( int i = 1; i < argc - 1; i++ ) {
     const char * a = argv[ i ];
+    int j;
     if ( a[ 0 ] != '-' || a[ 1 ] < '0' || a[ 1 ] > '9' )
       continue;
     char * end = NULL;
@@ -1126,10 +1089,18 @@ main( int argc,  const char *argv[] )
       fprintf( stderr, "bad net index: %s (1..%u)\n", a, MAX_NETS );
       return 1;
     }
+    for ( j = 0; j + i + 1 < argc; j++ ) {
+      if ( argv[ j + i + 1 ][ 0 ] == '-' )
+        break;
+    }
+    if ( j == 0 ) {
+      fprintf( stderr, "zero net config: %s\n", a );
+      return 1;
+    }
     NetDef nd;
-    if ( ! parse_net_tuple( (uint32_t) idx, argv[ i + 1 ], nd ) ) {
+    if ( ! parse_net_tuple( (uint32_t) idx, &argv[ i + 1 ], (uint32_t) j, nd ) ) {
       fprintf( stderr,
-        "bad net tuple: %s %s (want role,proto[,daemon[,network[,service]]],"
+        "bad net tuple: %s %s (want role proto[ daemon[ network[ service [wild]]]],"
         " role feed|sub, proto sass2|sass3|both)\n", a, argv[ i + 1 ] );
       return 1;
     }
@@ -1137,8 +1108,22 @@ main( int argc,  const char *argv[] )
     if ( x < i + 2 )
       x = i + 2;
   }
-  if ( cfile != NULL && ! load_nets_config( cfile, cfg ) )
+  if ( cfile != NULL && ! load_config( cfile, cfg ) )
     return 1;
+  /* explicit CLI values override config-file values */
+  if ( map     != NULL ) cfg.map_name     = map;
+  if ( path    != NULL ) cfg.dict_path    = path;
+  if ( daemon  != NULL ) cfg.base.daemon  = daemon;
+  if ( network != NULL ) cfg.base.network = network;
+  if ( service != NULL ) cfg.base.service = service;
+  if ( replace != NULL ) cfg.replace_typeless_msgs = true;
+  if ( routem  != NULL ) cfg.route_after_merge = true;
+  if ( quiet   != NULL ) cfg.quiet   = true;
+  if ( verb    != NULL ) cfg.verbose = true;
+  if ( evict   != NULL ) cfg.message_eviction_secs = (uint32_t) atoi( evict );
+  if ( pend    != NULL ) cfg.pending_initial_secs  = (uint32_t) atoi( pend );
+  if ( acctf   != NULL ) cfg.accounting_file = acctf;
+  if ( seqm    != NULL ) cfg.sequence_policy = parse_seq( seqm );
   /* default topology when no nets are declared */
   if ( cfg.nets.count == 0 ) {
     NetDef f, s;
@@ -1167,50 +1152,24 @@ main( int argc,  const char *argv[] )
       return 1;
     }
   }
-  cfg.sass3_feed = sfeed;
-  cfg.sass3_name = fname;
-  cfg.merge_default = ( mergem != NULL );
-  cfg.route_after_merge = ( routem != NULL );
-  cfg.quiet = ( quiet != NULL );
-  cfg.verbose = ( verb != NULL );
-  if ( hold )  cfg.hold_secs = (uint32_t) atoi( hold );
-  if ( stale ) cfg.stale_secs = (uint32_t) atoi( stale );
-  if ( pend )  cfg.pending_secs = (uint32_t) atoi( pend );
-  cfg.acct_file = acctf;
-  if ( seqm != NULL ) {
-    if ( ::strcmp( seqm, "strict" ) == 0 )      cfg.seq = SEQ_STRICT;
-    else if ( ::strcmp( seqm, "stamp" ) == 0 )  cfg.seq = SEQ_STAMP;
-    else                                        cfg.seq = SEQ_OBSERVE;
-  }
-  /* collect repeatable -w */
-  for ( int i = 1; i < argc - 1; i++ ) {
-    if ( ::strcmp( argv[ i ], "-w" ) == 0 )
-      cfg.wildcards.push( (const char *) argv[ i + 1 ] );
-  }
+  MDMsgDict dict;
+  dict.load( cfg.dict_path );
 
-  /* milestone 1: SASS3 feed-side attachments are not yet implemented */
-  if ( cfg.sass3_feed != NULL ) {
-    fprintf( stderr, "-S (SASS3 upstream feed) not yet implemented "
-                     "(milestone 2)\n" );
+  EvShm  shm( "rv_cache" );
+  if ( shm.open( cfg.map_name, 0 ) != 0 )
     return 1;
-  }
-  if ( cfg.sass3_name != NULL ) {
-    fprintf( stderr, "-F (SASS3 downstream service) not yet implemented "
-                     "(milestone 2)\n" );
-    return 1;
-  }
 
   EvPoll poll;
   poll.init( 5, false );
 
-  RvCache cache( poll, cfg );
-  if ( cfg.acct_file != NULL ) {
-    if ( ::strcmp( cfg.acct_file, "-" ) == 0 )
+  RvCache cache( poll, shm, dict, cfg );
+  if ( cfg.accounting_file != NULL ) {
+    if ( ::strcmp( cfg.accounting_file, "-" ) == 0 )
       cache.acct = stdout;
     else {
-      cache.acct = ::fopen( cfg.acct_file, "a" );
+      cache.acct = ::fopen( cfg.accounting_file, "a" );
       if ( cache.acct == NULL )
-        perror( cfg.acct_file );
+        perror( cfg.accounting_file );
     }
   }
 

@@ -121,11 +121,215 @@ CacheTab::normalize_msg_type( const void *&bytes,  size_t &len,
   return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* shm image store: subject-keyed values in the raikv map (-m map_name).
+ * EvKeyCtx computes the 128-bit key hash from the map's seed and primes
+ * KeyCtx (the same operand struct raids queues for prefetch, so the
+ * Milestone 3 batching pipeline slots in without another refactor).
+ * The value is the bare image bytes; the encoding rides in the
+ * HashEntry's type byte ((uint8_t) TYPE_ID, matcher ftype convention),
+ * the same slot raids uses for redis value types.  MDMsg::unpack()
+ * accepts the byte as a msg_enc hint. */
+
+/* HashEntry type byte -> full raimd TYPE_ID (for EvPublish msg_enc /
+ * make_rv_msg, which switch on the 32-bit ids).  Built once from the
+ * registered matcher table; unknown bytes pass through unchanged. */
+static uint32_t
+enc_of_type_byte( uint8_t b ) noexcept
+{
+  static uint32_t tab[ 256 ];
+  static bool     init;
+  if ( ! init ) {
+    uint32_t i = 0;
+    for ( MDMatch *ma = MDMsg::first_match( i ); ma != NULL;
+          ma = MDMsg::next_match( i ) ) {
+      if ( ma->hint_size > 0 && tab[ ma->ftype ] == 0 )
+        tab[ ma->ftype ] = ma->hint[ 0 ];
+    }
+    init = true;
+  }
+  return tab[ b ] != 0 ? tab[ b ] : b;
+}
+
+void
+CacheTab::init_shm( EvShm &shm ) noexcept
+{
+  if ( shm.map == NULL )
+    return;
+  this->map  = shm.map;
+  this->kctx = new ( ::malloc( sizeof( KeyCtx ) ) )
+               KeyCtx( *shm.map, shm.dbx_id );
+  this->map->hdr.get_hash_seed( this->kctx->db_num, this->hseed );
+}
+
+EvKeyCtx *
+CacheTab::key_of( const CacheEntry &e ) noexcept
+{
+  size_t sz = EvKeyCtx::size( e.len );
+  if ( sz > this->keybuf_len ) {
+    size_t n = this->keybuf_len == 0 ? 256 : this->keybuf_len;
+    while ( n < sz )
+      n *= 2;
+    this->keybuf = (char *) ::realloc( this->keybuf, n );
+    this->keybuf_len = n;
+  }
+  return new ( this->keybuf )
+         EvKeyCtx( *this->map, NULL, e.value, e.len, 0, 0, this->hseed );
+}
+
+bool
+CacheTab::shm_set( CacheEntry &e,  const void *bytes,  size_t len,
+                   uint32_t enc ) noexcept
+{
+  KeyCtx & kc = *this->kctx;
+  this->key_of( e )->set( kc );
+  this->wrk.reset();
+  KeyStatus status = kc.acquire( &this->wrk );
+  if ( status <= KEY_IS_NEW ) {
+    void   * p;
+    uint64_t oldsz;
+    if ( status == KEY_OK && kc.value( &p, oldsz ) == KEY_OK )
+      this->image_bytes -= oldsz;
+    if ( kc.resize( &p, len ) == KEY_OK ) {
+      ::memcpy( p, bytes, len );
+      kc.set_type( (uint8_t) enc ); /* matcher ftype = (uint8_t) TYPE_ID */
+      this->image_bytes += len;
+      e.image_len = len;   /* local mirror: stats / last-known size only */
+      e.image_enc = enc;
+      kc.release();
+      return true;
+    }
+    kc.release();
+  }
+  return false;
+}
+
+size_t
+CacheTab::shm_merge( CacheEntry &e,  const void *upd,  size_t upd_len,
+                     uint32_t upd_enc ) noexcept
+{
+  /* single-lock read-modify-write: acquire, unpack old value in place,
+   * rebuild merged into scratch, normalize, resize + copy, release */
+  KeyCtx & kc = *this->kctx;
+  this->key_of( e )->set( kc );
+  this->wrk.reset();
+  KeyStatus status = kc.acquire( &this->wrk );
+  if ( status > KEY_IS_NEW )
+    return 0;
+  void   * p       = NULL;
+  uint64_t oldsz   = 0;
+  size_t   out     = 0;
+  uint32_t out_enc = 0;
+  if ( status == KEY_OK && kc.value( &p, oldsz ) == KEY_OK && oldsz > 0 ) {
+    /* the HashEntry type byte is the msg_enc hint: unpack always
+     * produces a message of the codec the byte declares */
+    out = this->build_merge( p, oldsz, kc.get_type(),
+                             upd, upd_len, upd_enc, out_enc );
+  }
+  const void * res;
+  size_t       res_len;
+  uint32_t     res_enc;
+  if ( out != 0 ) {   /* merged bytes in scratch, cached codec preserved */
+    res     = this->scratch;
+    res_len = out;
+    res_enc = out_enc;
+  }
+  else {              /* no old image / parse fail: replace outright */
+    res     = upd;
+    res_len = upd_len;
+    res_enc = upd_enc;
+  }
+  this->normalize_msg_type( res, res_len, res_enc );
+  void * dst;
+  this->image_bytes -= oldsz;
+  if ( kc.resize( &dst, res_len ) == KEY_OK ) {
+    ::memcpy( dst, res, res_len );
+    kc.set_type( (uint8_t) res_enc );
+    this->image_bytes += res_len;
+    e.image_len = res_len;
+    e.image_enc = res_enc;
+  }
+  else {
+    res_len = 0;
+  }
+  kc.release();
+  return res_len;
+}
+
+bool
+CacheTab::shm_get( CacheEntry &e,  void *&bytes,  size_t &len,
+                   uint32_t &enc ) noexcept
+{
+  KeyCtx & kc = *this->kctx;
+  this->key_of( e )->set( kc );
+  this->wrk.reset();
+  if ( kc.find( &this->wrk ) != KEY_OK )
+    return false;
+  void   * p;
+  uint64_t sz;
+  if ( kc.value( &p, sz ) != KEY_OK || sz == 0 )
+    return false;
+  size_t n = sz;
+  if ( n > this->imgbuf_len ) {
+    size_t b = this->imgbuf_len == 0 ? 1024 : this->imgbuf_len;
+    while ( b < n )
+      b *= 2;
+    this->imgbuf = (char *) ::realloc( this->imgbuf, b );
+    this->imgbuf_len = b;
+  }
+  ::memcpy( this->imgbuf, p, n );
+  bytes = this->imgbuf;
+  len   = n;
+  /* publish paths (make_rv_msg / EvPublish.msg_enc) switch on the full
+   * 32-bit type id; expand the HashEntry byte back through the matcher
+   * table */
+  enc   = enc_of_type_byte( kc.get_type() );
+  return true;
+}
+
+void
+CacheTab::shm_evict( CacheEntry &e ) noexcept
+{
+  KeyCtx & kc = *this->kctx;
+  this->key_of( e )->set( kc );
+  this->wrk.reset();
+  KeyStatus status = kc.acquire( &this->wrk );
+  if ( status <= KEY_IS_NEW ) {
+    void   * p;
+    uint64_t sz;
+    if ( status == KEY_OK && kc.value( &p, sz ) == KEY_OK )
+      this->image_bytes -= sz;
+    kc.tombstone();
+    kc.release();
+  }
+  e.image_len = 0;
+}
+
+bool
+CacheTab::get_image( CacheEntry &e,  void *&bytes,  size_t &len,
+                     uint32_t &enc ) noexcept
+{
+  if ( this->shm_mode() )
+    return this->shm_get( e, bytes, len, enc );
+  if ( e.image == NULL )
+    return false;
+  bytes = e.image;
+  len   = e.image_len;
+  enc   = e.image_enc;
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+
 void
 CacheTab::set_image( CacheEntry &e,  const void *bytes,  size_t len,
                      uint32_t enc ) noexcept
 {
   this->normalize_msg_type( bytes, len, enc );
+  if ( this->shm_mode() ) {
+    this->shm_set( e, bytes, len, enc );
+    return;
+  }
   if ( e.image != NULL ) {
     this->image_bytes -= e.image_len;
     ::free( e.image );
@@ -137,35 +341,40 @@ CacheTab::set_image( CacheEntry &e,  const void *bytes,  size_t len,
   this->image_bytes += len;
 }
 
-/* field-merge: rebuild image from old image, overwriting fields present in
- * the update and appending fields only in the update.  Field name is the
- * merge key (RvMsgWriter into fresh scratch, then swap via set_image). */
+/* two-pass field-merge of upd over oldb into scratch: existing field
+ * order preserved, values overwritten when present in the update, fields
+ * only in the update appended.  Field name is the merge key.  Returns the
+ * merged length (bytes guaranteed in this->scratch) or 0 on parse or
+ * writer failure (caller falls back to replace). */
 size_t
-CacheTab::merge( CacheEntry &e,  const void *upd,  size_t upd_len,
-                 uint32_t upd_enc ) noexcept
+CacheTab::build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
+                       const void *upd,  size_t upd_len,
+                       uint32_t upd_enc,  uint32_t &out_enc ) noexcept
 {
-  /* no existing image -> update becomes the image outright */
-  if ( e.image == NULL ) {
-    this->set_image( e, upd, upd_len, upd_enc );
-    return e.image_len;
-  }
   MDMsgMem mem;
-  MDMsg * oldm = MDMsg::unpack( e.image, 0, e.image_len, e.image_enc,
-                               NULL, mem );
+  MDMsg * oldm = MDMsg::unpack( (void *) oldb, 0, old_len, old_enc,
+                                NULL, mem );
   MDMsg * newm = MDMsg::unpack( (void *) upd, 0, upd_len, upd_enc, NULL, mem );
-  if ( oldm == NULL || newm == NULL ) {
-    /* cannot parse one side: fall back to replace */
-    this->set_image( e, upd, upd_len, upd_enc );
-    return e.image_len;
-  }
+  if ( oldm == NULL || newm == NULL )
+    return 0;
   MDFieldIter * oit = NULL,
               * nit = NULL;
-  if ( oldm->get_field_iter( oit ) != 0 || newm->get_field_iter( nit ) != 0 ) {
-    this->set_image( e, upd, upd_len, upd_enc );
-    return e.image_len;
+  if ( oldm->get_field_iter( oit ) != 0 || newm->get_field_iter( nit ) != 0 )
+    return 0;
+  this->ensure_scratch( old_len + upd_len + 256 );
+  /* writer of the cached message's own codec (MDMsg::create_writer);
+   * the merged image keeps its encoding instead of converting to RVMSG.
+   * Codecs without a writer fall back to RvMsgWriter as before. */
+  RvMsgWriter       rvw( mem, this->scratch, this->scratch_len );
+  MDMsgWriterBase * w = NULL;
+  if ( oldm->create_writer( w, mem, NULL, this->scratch,
+                            this->scratch_len ) == 0 && w != NULL ) {
+    out_enc = oldm->get_type_id();
   }
-  this->ensure_scratch( e.image_len + upd_len + 256 );
-  RvMsgWriter w( mem, this->scratch, this->scratch_len );
+  else {
+    w = &rvw;
+    out_enc = RVMSG_TYPE_ID;
+  }
 
   /* pass 1: existing field order preserved; overwrite value if in update */
   if ( oit->first() == 0 ) {
@@ -175,31 +384,57 @@ CacheTab::merge( CacheEntry &e,  const void *upd,  size_t upd_len,
       if ( oit->get_name( nm ) != 0 )
         continue;
       if ( nit->find( nm, mref ) == 0 )
-        w.append_ref( nm.fname, nm.fnamelen, mref );   /* updated value */
+        w->append_iter( nit );             /* updated value */
       else if ( oit->get_reference( mref ) == 0 )
-        w.append_ref( nm.fname, nm.fnamelen, mref );   /* retained value */
+        w->append_iter( oit );             /* retained value */
     } while ( oit->next() == 0 );
   }
   /* pass 2: append fields that appear only in the update */
   if ( nit->first() == 0 ) {
     do {
       MDName nm;
-      MDReference mref, tmp;
+      MDReference tmp;
       if ( nit->get_name( nm ) != 0 )
         continue;
-      if ( oit->find( nm, tmp ) != 0 ) { /* not in old image -> append */
-        if ( nit->get_reference( mref ) == 0 )
-          w.append_ref( nm.fname, nm.fnamelen, mref );
-      }
+      if ( oit->find( nm, tmp ) != 0 )     /* not in old image -> append */
+        w->append_iter( nit );
     } while ( nit->next() == 0 );
   }
-  size_t out_len = w.update_hdr();
-  if ( w.err != 0 ) {
-    /* writer overflow/error: fall back to replace so cache stays coherent */
+  size_t out_len = w->update_hdr();
+  if ( w->err != 0 )
+    return 0;      /* writer overflow/error */
+  if ( (char *) w->buf != this->scratch ) {
+    /* writer resized into MDMsgMem (dies with mem): copy out to scratch */
+    this->ensure_scratch( out_len );
+    ::memcpy( this->scratch, w->buf, out_len );
+  }
+  return out_len;
+}
+
+/* field-merge: rebuild image from old image, overwriting fields present in
+ * the update and appending fields only in the update.  shm mode does the
+ * read-modify-write under a single entry lock (shm_merge); heap mode
+ * rebuilds into scratch then swaps via set_image. */
+size_t
+CacheTab::merge( CacheEntry &e,  const void *upd,  size_t upd_len,
+                 uint32_t upd_enc ) noexcept
+{
+  if ( this->shm_mode() )
+    return this->shm_merge( e, upd, upd_len, upd_enc );
+  /* no existing image -> update becomes the image outright */
+  if ( e.image == NULL ) {
     this->set_image( e, upd, upd_len, upd_enc );
     return e.image_len;
   }
-  this->set_image( e, w.buf, out_len, RVMSG_TYPE_ID );
+  uint32_t out_enc = 0;
+  size_t out_len = this->build_merge( e.image, e.image_len, e.image_enc,
+                                      upd, upd_len, upd_enc, out_enc );
+  if ( out_len == 0 ) {
+    /* cannot parse one side / writer overflow: fall back to replace */
+    this->set_image( e, upd, upd_len, upd_enc );
+    return e.image_len;
+  }
+  this->set_image( e, this->scratch, out_len, out_enc );
   return e.image_len;
 }
 
@@ -210,6 +445,8 @@ CacheTab::evict( const char *subj,  size_t len ) noexcept
   RouteLoc loc;
   CacheEntry * e = this->tab.find( h, subj, len, loc );
   if ( e != NULL ) {
+    if ( this->shm_mode() )
+      this->shm_evict( *e );
     if ( e->image != NULL ) {
       this->image_bytes -= e->image_len;
       ::free( e->image );

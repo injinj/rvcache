@@ -8,6 +8,9 @@
 #include <raimd/md_msg.h>
 #include <raikv/route_ht.h>
 #include <raikv/array_space.h>
+#include <raikv/shm_ht.h>
+#include <raikv/key_ctx.h>
+#include <raikv/ev_key.h>
 
 namespace rvcache {
 
@@ -27,8 +30,9 @@ struct NetParm {
 
 static const uint32_t MAX_NETS = 64; /* fwd_mask is 64 bits */
 
-/* one network attachment: -<idx> role,proto[,daemon[,network[,service]]]
- * or an entry in the -c json/yaml nets array.  mask bit = idx - 1 */
+/* one network attachment: -<idx> role proto [daemon [network [service
+ * [wildcard]]]] (argv-separated -- network configs contain commas) or an
+ * entry in the -c json/yaml nets array.  mask bit = idx - 1 */
 struct NetDef {
   uint32_t idx;      /* CLI integer, 1 .. MAX_NETS */
   bool     is_feed,  /* feed | sub */
@@ -49,26 +53,22 @@ struct NetDef {
 struct Config {
   NetParm      base;             /* -d -n -s */
   rai::kv::ArrayCount< NetDef, 8 > nets; /* -<idx> tuples / -c file */
-  const char * sass3_feed;       /* -S <feed>  (feed-side sass3) */
-  const char * sass3_name;       /* -F <name>  (downstream service) */
-  rai::kv::ArrayCount< const char *, 4 > wildcards; /* -w (repeatable) */
-  uint32_t     hold_secs;        /* -D  SASS3 hold timer, sass3 nets only
-                                  *     (internal to sass3_db / -S reassert;
-                                  *     no effect on RV-side interest) */
-  bool         merge_default;    /* -m  */
-  SeqPolicy    seq;              /* -Q  */
-  bool         route_after_merge;/* -M  */
-  uint32_t     stale_secs;       /* -x  (0 == never) */
-  uint32_t     pending_secs;     /* -P  (default 10) */
-  const char * acct_file;        /* -A  ('-' == stdout) */
-  bool         quiet;            /* -q  */
-  bool         verbose;          /* -v  */
+  const char * map_name,             /* -m  */
+             * accounting_file,      /* -A  ('-' == stdout) */
+             * dict_path;            /* -p  */
+  uint32_t     message_eviction_secs,/* -x  (0 == never) */
+               pending_initial_secs; /* -P  (default 10) */
+  SeqPolicy    sequence_policy;      /* -Q  */
+  bool         replace_typeless_msgs, /* -r  replace (not merge) typeless */
+               route_after_merge,    /* -M  */
+               quiet,                /* -q  */
+               verbose;              /* -v  */
 
-  Config() : sass3_feed( 0 ), sass3_name( 0 ), hold_secs( 480 ),
-             merge_default( false ), seq( SEQ_OBSERVE ),
-             route_after_merge( false ),
-             stale_secs( 0 ), pending_secs( 10 ), acct_file( 0 ),
-             quiet( false ), verbose( false ) {}
+  Config() : map_name( 0 ), accounting_file( 0 ), dict_path( 0 ),
+             message_eviction_secs( 0 ), pending_initial_secs( 10 ),
+             sequence_policy( SEQ_OBSERVE ), replace_typeless_msgs( false ),
+             route_after_merge( false ), quiet( false ), verbose( false ) {}
+
   /* resolve a net's (d,n,s) triple, base filling gaps */
   void resolve( const NetDef &nd,  const char *&d,  const char *&n,
                 const char *&s ) const {
@@ -78,26 +78,41 @@ struct Config {
   }
 };
 
+/* config parsing (config.cpp): -<idx> net tuples (argv slice), -Q seqno
+ * policy names and the -c json/yaml config file (long-name keys; only
+ * the important knobs are CLI flags) */
+bool parse_net_tuple( uint32_t idx,  const char **f,  uint32_t cnt,
+                      NetDef &nd ) noexcept;
+SeqPolicy parse_seq( const char *s ) noexcept;
+bool load_config( const char *path,  Config &cfg ) noexcept;
+
 struct Stats {
-  uint64_t ticks_in,          /* _TIC.> messages consumed on net 1 */
-           ticks_forwarded,   /* re-published on net 2 (live holder) */
-           dropped_no_listener,/* dropped: no live holder */
-           snaps_served,      /* _SNAP images served */
-           snaps_missed,      /* _SNAP misses (TRANSIENT/NOT_FOUND) */
-           interest_opens,    /* holder added (0->1 on a subject) */
-           interest_closes,   /* subject dropped to 0 holders */
-           evicted,           /* cache entries evicted (DROP) */
-           seq_regress,       /* seqno went backwards */
-           seq_gap,           /* seqno gap detected */
-           transient_pass,    /* TRANSIENT ticks forwarded, not cached */
-           nosub_sent;        /* NOSUBSCRIBERS DROP emitted */
+  uint64_t log_ns,
+           cache_msg_count,   /* count of message in cache */
+           cache_msg_bytes,   /* count of bytes for message cache */
+           msgs_recv,         /* _TIC.> messages consumed */
+           msgs_sent,         /* msgs re-published to sub nets */
+           bytes_recv,        /* _TIC.> bytes consumbed */
+           bytes_sent,        /* bytes re-published to sub nets */
+           msgs_forwarded,    /* recv msgs forward so a listner */
+           msgs_transient_fwd,/* TRANSIENT ticks forwarded, not cached */
+           msgs_no_listener,  /* msgs not fwd, no sub */
+           initials_sent,     /* initial images served */
+           initials_not_found,/* initial misses (TRANSIENT/NOT_FOUND) */
+           snaps_sent,        /* snapshot images served */
+           snaps_not_found,   /* snapshot misses (TRANSIENT/NOT_FOUND) */
+           subscriptions_active,/* total subs */
+           subscription_starts,/* sub added (0->1 on a subject) */
+           subscription_stops, /* sub dropped to 0 holders */
+           msgs_evicted,      /* cache entries evicted (DROP) */
+           sequence_regress,  /* seqno went backwards */
+           sequence_gap,      /* seqno gap detected */
+           heap_mem_info,
+           user_cpu_usecs,
+           sys_cpu_usecs;
   Stats() { this->reset_totals(); }
   void reset_totals( void ) {
-    this->ticks_in = this->ticks_forwarded = this->dropped_no_listener = 0;
-    this->snaps_served = this->snaps_missed = 0;
-    this->interest_opens = this->interest_closes = 0;
-    this->evicted = this->seq_regress = this->seq_gap = 0;
-    this->transient_pass = this->nosub_sent = 0;
+    ::memset( (void *) this, 0, sizeof( *this ) );
   }
 };
 
@@ -147,9 +162,31 @@ struct CacheTab {
   size_t                     scratch_len,
                              scratch2_len;
   uint64_t                   image_bytes; /* sum of image_len across entries */
+  /* shm image store (-m map_name): when map != NULL, image bytes live in
+   * the raikv HashTab keyed by subject (value = bare msg bytes; the
+   * encoding is the single type byte in the kv HashEntry, set_type() =
+   * (uint8_t) of the raimd TYPE_ID -- the same slot raids uses for redis
+   * value types, and MDMsg::unpack() accepts it as the msg_enc hint, so
+   * unpacking always produces a message).  CacheEntry::image stays NULL.
+   * EvKeyCtx carries the subject key + 128-bit hash into KeyCtx ops (and
+   * is the unit the raids-style prefetch pipeline queues, when that
+   * lands - SPEC Milestone 3 notes) */
+  rai::kv::HashTab         * map;         /* EvShm.map when -m given */
+  rai::kv::KeyCtx          * kctx;        /* shm key op context */
+  rai::kv::HashSeed          hseed;       /* map hash seed for db 0 */
+  rai::kv::WorkAllocT< 1024 > wrk;        /* kv work mem, reset per op */
+  char                     * keybuf,      /* EvKeyCtx placement buffer */
+                           * imgbuf;      /* shm get_image copy-out */
+  size_t                     keybuf_len,
+                             imgbuf_len;
 
   CacheTab() : next_id( 1 ), scratch( 0 ), scratch2( 0 ), scratch_len( 0 ),
-               scratch2_len( 0 ), image_bytes( 0 ) {}
+               scratch2_len( 0 ), image_bytes( 0 ), map( 0 ), kctx( 0 ),
+               keybuf( 0 ), imgbuf( 0 ), keybuf_len( 0 ), imgbuf_len( 0 ) {}
+
+  /* attach the shm image store; no-op when shm.map == NULL (no -m) */
+  void init_shm( rai::kv::EvShm &shm ) noexcept;
+  bool shm_mode( void ) const { return this->map != NULL; }
 
   CacheEntry * find( const char *subj,  size_t len ) noexcept;
   CacheEntry * upsert( const char *subj,  size_t len,  bool &is_new ) noexcept;
@@ -172,10 +209,34 @@ struct CacheTab {
   /* field-merge update bytes into e's image; rebuild + swap.  returns len */
   size_t merge( CacheEntry &e,  const void *upd,  size_t upd_len,
                 uint32_t upd_enc ) noexcept;
+  /* fetch e's image for serving/forwarding: heap mode returns e.image
+   * (stamping mutates the cached bytes, as before); shm mode copies the
+   * kv value into imgbuf (stamping mutates the copy; every send
+   * re-stamps, so the stored MSG_TYPE is dead weight either way).
+   * bytes stays valid until the next CacheTab operation.  false = no
+   * image (miss or tombstoned) */
+  bool get_image( CacheEntry &e,  void *&bytes,  size_t &len,
+                  uint32_t &enc ) noexcept;
   void evict( const char *subj,  size_t len ) noexcept;
   size_t count( void ) const { return this->tab.pop_count(); }
   void ensure_scratch( size_t n ) noexcept;
   void ensure_scratch2( size_t n ) noexcept;
+  /* --- shm internals (cache_tab.cpp) --- */
+  rai::kv::EvKeyCtx * key_of( const CacheEntry &e ) noexcept;
+  /* two-pass field-merge of upd over old into scratch; 0 = parse/overflow
+   * failure (caller falls back to replace).  shared by heap + shm merge.
+   * The writer comes from MDMsg::create_writer() so the merged image
+   * keeps the cached message's own codec; out_enc = its type id */
+  size_t build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
+                      const void *upd,  size_t upd_len,
+                      uint32_t upd_enc,  uint32_t &out_enc ) noexcept;
+  bool   shm_set( CacheEntry &e,  const void *bytes,  size_t len,
+                  uint32_t enc ) noexcept;
+  size_t shm_merge( CacheEntry &e,  const void *upd,  size_t upd_len,
+                    uint32_t upd_enc ) noexcept;
+  bool   shm_get( CacheEntry &e,  void *&bytes,  size_t &len,
+                  uint32_t &enc ) noexcept;
+  void   shm_evict( CacheEntry &e ) noexcept;
 };
 
 } // namespace rvcache

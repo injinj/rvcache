@@ -2,7 +2,7 @@
 
 RV subject cache with interest-driven tick forwarding.
 
-rv_cache sits between a feed side (publishers sending ticks on
+rvcache sits between a feed side (publishers sending ticks on
 `_TIC.<subject>`) and a consumer side (native RV listeners, rv7 clients,
 SASS3 subscribers). It maintains a last-image cache per subject, answers
 snapshot requests, and forwards ticks only for subjects that currently
@@ -31,14 +31,19 @@ See [SPEC.md](SPEC.md) for the design document and
 - **Snapshot service** — point-to-point snapshot replies served from the
   cache (`_SNAP.<subject>` request/reply), so late joiners get an image
   without waiting for the next tick.
-- **Separate feed / sub networks** — the feed attachment and the consumer
-  attachment are independent RV sessions, each with its own
-  `(daemon, network, service)`; they may be collapsed onto one rvd as a
-  deployment choice.
+- **Arbitrary network attachments** — any number of feed and sub nets
+  (1..64), each an independent RV session with its own
+  `(daemon, network, service)` and optional subject wildcard; they may
+  be collapsed onto one rvd as a deployment choice. Declared on the
+  command line (`-<idx> role proto ...`) or in a json/yaml config file
+  (`-c`), which also carries the less-common options as long-name keys.
 - **Sequence handling** — observe, strict, or stamp modes for SASS
   sequence numbers (`-Q`).
 - **Accounting** — per-subject open/close/image events as JSON lines
   (`-A file`, `-` for stdout).
+- **Shared-memory / dictionary hooks** — `-m map_name` opens a raikv shm
+  segment for the image store (milestone 3 wires it), `-p path` loads a
+  SASS dictionary (default `$cfile_path`).
 
 ## Build
 
@@ -52,7 +57,7 @@ this directory (the same layout the GNUmakefile probes with
 
 ```console
 $ ls ..
-libdecnumber  raikv  raimd  rv_cache  sassrv
+libdecnumber  raikv  raimd  rvcache  sassrv
 
 $ make
 ```
@@ -63,38 +68,57 @@ A debug build is available with `make port_extra=-g`.
 ## Usage
 
 ```console
-$ rv_cache -h
-rv_cache [-d daemon] [-n network] [-s service] (defaults for 4 nets)
-  [-1 d,n,s] rv feed   [-2 d,n,s] rv sub
-  [-3 d,n,s] sass3 feed [-4 d,n,s] sass3 sub
-  [-w wild] interest filter (repeatable)
-  [-S feed] SASS3 upstream (net 3)   [-F name] SASS3 downstream (net 4)
-  [-D secs] sass3 hold timer (480; no effect without -S/-F)
-  [-m] merge typeless   [-Q obs|strict|stamp]
-  [-M] route-after-merge   [-x secs] stale expiry
-  [-P secs] pending timeout (10)   [-A file] accounting jsonl (- stdout)
-  [-q] quiet stats   [-v] verbose submgr log
+$ rvcache -h
+rvcache [-d daemon] [-n network] [-s service] (defaults)
+  [-<idx> role proto[ daemon[ network[ service[ wildcard]]]]] net
+  [-p path]             = dictionary search path
+  [-c file]             = json/yaml config (.yaml/.yml = yaml)
+  [-m map_name]         = shm name to cache msgs
+  [-r]                  = replace typeless msgs
+  [-Q obs|strict|stamp] = message sequence policy
+  [-M]                  = route-after-merge
+  [-x secs]             = eviction expiry
+  [-P secs]             = pending timeout (10)
+  [-A file]             = accounting jsonl (- stdout)
+  [-q]                  = quiet stats
+  [-v]                  = verbose submgr log
 ```
 
 - `-d`, `-n`, `-s` set the default daemon / network / service for all
-  attachments (defaults `tcp:7500`, `""`, `7500`).
-- `-1` / `-2` (and `-3` / `-4` for the SASS3 attachments) override the
-  triple per network as `daemon,network,service`; any field may be left
-  empty to keep the default.
-- `-w` restricts interest tracking and forwarding to subjects under a
-  wildcard; repeat for multiple filters.
+  attachments.
+- `-<idx>` declares a net attachment (idx 1..64): role `feed|sub`, proto
+  `sass2|sass3|both`, then optional daemon / network / service /
+  wildcard. Fields are **argv-separated** (network configs contain
+  commas) and run to the next `-flag`; pass `''` to skip a middle field
+  and keep the `-d/-n/-s` default. The optional wildcard scopes the
+  attachment: on a sub net it filters interest tracking, on a feed net
+  it narrows the upstream subscription (`_TIC.<wild>.>` /
+  `_SASS.<wild>.PUB`). Default topology when no nets are declared:
+  `-1 feed sass2 -2 sub both`.
+- Only the important knobs are CLI flags. The `-c` json/yaml config
+  file carries everything as long-name top-level keys — `daemon`,
+  `network`, `service`, `nets` (array of `{index, role, proto, daemon,
+  network, service, wildcard}`), `map_name`, `dict_path`,
+  `replace_typeless_msgs`, `sequence_policy`, `route_after_merge`,
+  `message_eviction_secs`, `pending_initial_secs`, `accounting_file`,
+  `quiet`, `verbose` — see [cache.yaml](cache.yaml); explicit CLI flags
+  override file values.
+- Typeless ticks (no `MSG_TYPE` field) **merge by default**; `-r`
+  switches to replace mode.
 - `-Q` selects sequence-number handling: `obs` (observe, default),
   `strict` (drop out-of-order), or `stamp` (rewrite).
-- `-x` expires cached images not refreshed within the given seconds;
+- `-x` evicts cached images not refreshed within the given seconds;
   `-P` bounds how long a snapshot request stays pending.
 
 ### Example
 
-Cache between a feed rvd and a consumer rvd, forwarding only `TEST.>`
-subjects, with accounting to stdout:
+Cache between a feed rvd and a consumer rvd, forwarding only `RSF.>`
+subjects, with accounting to a file:
 
 ```console
-$ rv_cache -1 tcp:7500,,7500 -2 tcp:7600,,7600 -w 'TEST.>' -A -
+$ rvcache -1 sub sass2 tcp:7500 'eth0;227.5.0.0' 7500 'RSF.>' \
+          -2 feed sass2 tcp:7600 'eth1;227.6.0.0' 7600 'RSF.>' \
+          -c cache.yaml -m sysv:raikv.shm -A subscript.log
 ```
 
 Consumers subscribe plain subjects on net 2; publishers send

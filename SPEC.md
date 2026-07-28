@@ -1,4 +1,4 @@
-# rv_cache — RV subject cache with interest-driven tick forwarding
+# rvcache — RV subject cache with interest-driven tick forwarding
 
 A sassrv + raimd caching test. Sits between a feed side (publishers that
 send ticks on `_TIC.<subject>`) and a consumer side (RV clients that listen
@@ -21,12 +21,12 @@ goes quiet (`RvHostEntry::check_query_needed`, 100s late →
 This is the recommended topology and the historical moral: **SASS3 existed
 because the later Tibco APIs had no submgr facility to query open
 subscriptions; sassrv's submgr restores it, making the extra protocol
-unnecessary for new code.** rv_cache in default mode is purely cache +
+unnecessary for new code.** rvcache in default mode is purely cache +
 interest-gated forwarder + snapshot service.
 
 *Legacy-compat (`-S <feed>`, optional):* for feeds that speak SASS3 (old
 APIs only — the protocol is undocumented; the authoritative source is
-`~/rai/RaiCore/src/cache/sass3_svc.cpp`), rv_cache acts as a SASS3
+`~/rai/RaiCore/src/cache/sass3_svc.cpp`), rvcache acts as a SASS3
 subscriber upstream: batch-resubscribes interest to `_SASS.<feed>.SUB`
 (`Sass3SubscribeConsumer::onMsg`) and consumes the `_SASS.<feed>.PUB`
 broadcast envelope (`Sass3Svc::doFeed`) instead of raw `_TIC.>` ticks.
@@ -38,52 +38,59 @@ Wire format in the appendix below.
 subscription protocol is forwarded toward the feed network, which then
 publishes only what was asked for. Interactive feeds are atypical inside
 rvd networks; where they occur, the interactive side is usually an
-exchange feed. rv_cache treats broadcast as the norm and interactive as
+exchange feed. rvcache treats broadcast as the norm and interactive as
 the compat/bridge case, matching that reality.
 
-## Network topology — four RV attachments
+## Network topology — RV attachment roles
 
-Presume **four networks**. Each is its own `EvRvClient` session on the
-shared `EvPoll`, with its own `(daemon, network, service)` parameters. The
-parameters **may be identical** — collapsing any or all four onto one
-physical rvd/network is a deployment choice, not a design assumption. The
-code never assumes two roles share a session, and never requires them to
-be distinct either.
+An rvcache process attaches to any number of RV networks (1..64), each
+declared as `-<idx> role proto [daemon [network [service [wildcard]]]]`
+(argv-separated fields — network configs like `eth0;227.5.0.0,227.5.0.1`
+contain commas, so a comma-joined tuple cannot carry them) or an entry
+in the `-c` json/yaml `nets` array. Each attachment is its
+own `EvRvClient` session on the shared `EvPoll`, with its own
+`(daemon, network, service)` parameters. The parameters **may be
+identical** — collapsing any or all attachments onto one physical
+rvd/network is a deployment choice, not a design assumption. The code
+never assumes two roles share a session, and never requires them to be
+distinct either. Default topology when nothing is declared:
+`-1 feed sass2 -2 sub both`.
 
-| # | Network | rv_cache role | Traffic |
-|---|---------|---------------|---------|
-| 1 | **rv feed** | data consumer (upstream) | inbound `_TIC.>` ticks (broadcast-feed) |
-| 2 | **rv sub** | data publisher (downstream) | outbound `<subject>` forwards, `_SNAP.>` RPC service, `_RV.INFO.SYSTEM.*` submgr interest tracking |
-| 3 | **rv sass3 feed** | SASS3 *client* (upstream) | send `_SASS.<feed>.SUB`, consume `_SASS.<feed>.PUB` envelopes (`-S` mode) |
-| 4 | **rv sass3 sub** | SASS3 *service* (downstream) | listen `_SASS.<name>.SUB` from legacy clients — **subscription maintenance only**; acks + initial images to reply inboxes. Data is NOT enveloped: subscribers listen on the bare `<subject>` itself |
+| role/proto | rvcache role | Traffic |
+|------------|--------------|---------|
+| **feed sass2** | data consumer (upstream) | inbound `_TIC.>` ticks (broadcast-feed) |
+| **sub sass2**  | data publisher (downstream) | outbound `<subject>` forwards, `_SNAP.>` RPC service, `_RV.INFO.SYSTEM.*` submgr interest tracking |
+| **feed sass3** | PUB-envelope consumer (upstream) | consume `_SASS.<feed>.PUB` broadcast envelopes |
+| **sub sass3**  | SASS3 *service* (downstream) | `_SASS.<name>.SUB` from legacy clients — **subscription maintenance only**; acks + initial images to reply inboxes. Data is NOT enveloped: subscribers listen on the bare `<subject>` itself |
 
-Networks 1+2 are the rvd-native data path; 3+4 are the legacy-compat SASS3
-path, each optional and independently enabled (`-S` enables 3, `-F` enables
-4). The SASS3 side (nets 3+4) is **specified but not yet implemented** —
-milestone 1 covers nets 1+2 only. Fully loaded, rv_cache is a **SASS3 concentrator/bridge**: legacy SASS3
-feed upstream, legacy SASS3 clients downstream, native RV consumers and
-feeds beside them on the same cache.
+`proto both` enables sass2+sass3 on one attachment (collapsed interest).
+All four roles are implemented as submgr-driven attachments; the one
+remaining unimplemented piece is the **`-S` upstream SASS3
+subscription-maintenance client** (batch `_SASS.<feed>.SUB` asserts /
+lease reasserts toward an interactive feed) — milestone 2. Fully loaded,
+rvcache is a **SASS3 concentrator/bridge**: legacy SASS3 feed upstream,
+legacy SASS3 clients downstream, native RV consumers and feeds beside
+them on the same cache.
 
-**Interest ownership — submgr refcnt on the RV side, leased refcnt in
-sass3_db on the SASS3 side:** downstream interest is tracked by two
-databases, one per protocol family. On network 2, `RvSubscriptionDB`
-(`sub_db`) owns subscription life outright: advisories and session/host
-queries drive `RvSubscription::refcnt` (one ref per session identity;
-`ref7cnt` marks a daemon-session holder), and **`refcnt != 0` is the
-forwarding gate** — no parallel rv_cache interest table, no RV-side decay
-timer. The advisory protocol already provides the full lifecycle:
-LISTEN.STOP derefs, session/host timeout sweeps deref, GC removes. On
-network 4, a `Sass3SubscriptionDB` (`sass3_db`, mirror-shaped after
-sub_db; **not yet implemented** — §5) owns SASS3 interest: the QueryFlags
-of incoming `_SASS.<name>.SUB` messages manage the refcnt (SUBSCRIBE refs,
-UNSUBSCRIBE derefs, RESUBSCRIBE renews the lease) and the **hold timer is
-internalized in sass3_db** — SASS3 leases are the one place interest may
-decay by clock, because legacy clients have no advisory channel. A tick is
-forwarded on a downstream network when that network's database shows
-refcnt > 0. A refcnt is still not a head-count — see the
-session-granularity note below. Upstream, network 1 is a passive firehose
-(no per-subject interest) and network 3 asserts the merged interest set
-via the SASS3 lease cycle when enabled.
+**Interest ownership — one submgr per sub net, both channels:** downstream
+interest is owned by `RvSubscriptionDB` (one instance per sub attachment,
+each with its own sub_tab/refcnts). On the sass2 channel, advisories and
+session/host queries drive `RvSubscription::refcnt` (one ref per session
+identity; `ref7cnt` marks a daemon-session holder) — no parallel rvcache
+interest table, no RV-side decay timer: LISTEN.STOP derefs, session/host
+timeout sweeps deref, GC removes. On the sass3 channel (submgr's
+`IS_SASS` wildcard subscription, sassrv f67b8ad), the QueryFlags of
+incoming `_SASS.<name>.SUB` messages manage the same refcnt (SUBSCRIBE
+refs, UNSUBSCRIBE derefs, RESUBSCRIBE renews the lease) and the **hold
+timer is internalized in submgr** (`RvSass3Entry` leases) — SASS3 leases
+are the one place interest may decay by clock, because legacy clients
+have no advisory channel. rvcache materializes the gate as
+`CacheEntry::fwd_mask`: a subscribe callback with `refcnt > 0` sets the
+net's bit, an unsubscribe with `refcnt == 0` clears it; a tick is
+forwarded to exactly the sub nets whose bit is set. A refcnt is still not
+a head-count — see the session-granularity note below. Upstream, a feed
+net is a passive firehose (no per-subject interest); milestone 2's `-S`
+client asserts the merged interest set via the SASS3 lease cycle.
 
 **Session granularity — why refcounts under-count:** the RV5 protocol
 attaches each subscription to the client's own *session*, so per-session
@@ -96,8 +103,8 @@ already-listened subject sees no fresh START (so no reply-inbox initial) —
 it pulls its initial via `_SNAP` instead. Consequences: the subscription
 tables count refs per (session identity, subject) — in sub_db a session
 identity is an rv5 client session or an rv6+ daemon session (≈ a whole
-host, flagged by `ref7cnt`); in sass3_db it is a SASS3 accounting
-identity; NOSUBSCRIBERS / last-listener logic operates at that
+host, flagged by `ref7cnt`); on the sass3 channel it is a SASS3
+accounting identity; NOSUBSCRIBERS / last-listener logic operates at that
 granularity; and nothing may assume one ref = one listener. The
 sassrv repo ships both client styles for testing — rv5-style (`rv_client`,
 `rv5_api_test`) and rv7-style (`subrv7test`, `fanrv7test`, …).
@@ -112,9 +119,9 @@ the daemon*.
 
 *The rv5 dialect is not just legacy:* the injinj NATS and redis servers
 (`natsmd`, `raids`) were designed to **emit rv5-type protocol for their
-pubsub** — meaning those servers can themselves be rv_cache clients, and
+pubsub** — meaning those servers can themselves be rvcache clients, and
 NATS subscribers / redis SUBSCRIBE clients transitively consume cached
-subjects with no changes on their side. rv_cache treats them as ordinary
+subjects with no changes on their side. rvcache treats them as ordinary
 rv5 session holders (they name their own sessions); interest, initials,
 host correlation, and accounting all apply unchanged. Deployment realism:
 this is an option, not an expectation — people run their NATS and redis
@@ -130,14 +137,14 @@ interest dialects therefore attribute to a host id: advisory holders from
 their session, SASS3 holders from the accounting `H` field or sender
 inbox, flagged-`_SNAP` holders from their reply inbox. On the RV side this is submgr's own
 machinery — LISTEN.STOP derefs the subscription, session/host timeouts
-sweep a dead host's sessions and their refs — rv_cache adds nothing. Where
+sweep a dead host's sessions and their refs — rvcache adds nothing. Where
 host correlation earns its keep is bounding *SASS3 lease ghosting*: SASS3
 subscribers hold their bare-subject *data* listen through the host's
 daemon like everyone else, and a daemon-session **LISTEN.STOP is
 authoritative — sent only when the host truly has no remaining subs on
-that subject** — so on STOP for (host, subject), sass3_db immediately
-expires every lease attributed to that host for that subject instead of
-waiting out the hold timer; host death (HOST.STATUS gone quiet) sweeps the
+that subject** — so on STOP for (host, subject), submgr immediately
+expires every sass3 lease attributed to that host for that subject
+instead of waiting out the hold timer; host death (HOST.STATUS gone quiet) sweeps the
 same way. The hold timer remains only as the backstop for SASS3 holders
 whose host correlation is unknown.
 
@@ -145,32 +152,32 @@ whose host correlation is unknown.
 delivery — `_SASS.<feed>.SUB` carries only interest, and SASS3 subscribers
 receive data by subscribing to the bare `<subject>` like any RV client.
 The `_SASS.<name>.PUB` envelope is a **feed-side construct only** (what an
-upstream SASS3 feed broadcasts to caches; rv_cache consumes it in `-S`
+upstream SASS3 feed broadcasts to caches; rvcache consumes it in `-S`
 mode, never emits it downstream). A cache-accepted tick is therefore
 published once per downstream network as a bare-subject publish, serving
 native-RV and SASS3 subscribers alike — this control/data separation is
 precisely what lets the SASS3 protocol coexist with the RV protocol on the
-same network. When networks 2 and 4 are distinct, the publish goes to each
-downstream network whose refcnt for the subject is > 0 (interest is
-tracked per downstream attachment: sub_db's advisory-driven refcnt for
-net 2, sass3_db's leased refcnt for net 4).
+same network. When the sass2 and sass3 sub nets are distinct, the publish
+goes to each downstream network whose refcnt for the subject is > 0
+(interest is tracked per downstream attachment: each sub net's submgr
+refcnt, materialized in the entry's `fwd_mask` bit).
 
 **Collapsed-parameter safety:** when all four attachments point at one
 network, loop freedom comes from subject namespaces — inputs (`_TIC.>`,
 `_SASS.<feed>.PUB`, `_SASS.<name>.SUB`) are disjoint from outputs
 (`<subject>`, `_SASS.<feed>.SUB`) **provided the downstream advertised
 name differs from the upstream feed name**; `<name> == <feed>` on a shared
-network would make rv_cache consume its own SUB sends, so startup rejects
+network would make rvcache consume its own SUB sends, so startup rejects
 that combination when the sass3 attachments share parameters. (The bare
 `<subject>` output namespace overlapping the consumer side is by design —
 that is the shared data plane — and it never overlaps inputs, which are
 all `_`-prefixed.)
 
-In the diagram below, the left column is networks 1/3, the right column is
-networks 2/4.
+In the diagram below, the left column is the feed nets, the right column
+the sub nets.
 
 ```
- feed side                      rv_cache                     consumer side
+ feed side                      rvcache                     consumer side
  ---------                      --------                     -------------
  publish _TIC.FOO ---------->  cache[FOO] merge/store
    (or _SASS.<feed>.PUB        refcnt(FOO) > 0 ? ----------> publish FOO
@@ -197,7 +204,7 @@ vocabularies are commonly understood by people who work these systems).
 `EXCHANGE` is `NaE` when there is no exchange (`NO.SUCH.6C.NaE`);
 raicache accepts 3-segment subjects and presumes the implied `.NaE` —
 but **as distinct cache keys**: no normalization, `NO.SUCH.6C` and
-`NO.SUCH.6C.NaE` are different entries. rv_cache does the same —
+`NO.SUCH.6C.NaE` are different entries. rvcache does the same —
 subjects are opaque strings (raicache's default behavior too). **The
 feed side enforces subject discipline**, not the cache: a Bloomberg
 feed or a hand-written exchange feed brings its own naming, and that —
@@ -205,16 +212,16 @@ not cache configuration — is what shapes the cache's subject space.
 
 | Subject                 | Direction        | Meaning |
 |-------------------------|------------------|---------|
-| `_TIC.<subject>`        | feed → rv_cache  | Tick/update payload for `<subject>` (RVMSG). Cached, and forwarded to `<subject>` when it has listeners. (SASS3 broadcast-feed role; a full deployment would use `_SASS.<source>.PUB`.) |
-| `<subject>`             | rv_cache → consumers | Forwarded tick payload, unchanged (or post-merge image with `route-after-merge` semantics, `-M`). |
-| `_SNAP.<subject>`       | consumer → rv_cache | Snapshot RPC. Optional QueryFlags-style `flags` field: absent/SNAPSHOT → image reply (default); SUBSCRIBE\|INITIAL_VALUES → image for a subscribing rv7 client — subscription *life* stays with the advisory refcnt (no `_SNAP` lease). submgr resolves the requester's session from the reply inbox; its `user_id` feeds accounting. |
-| `_INBOX.…` (reply)      | rv_cache → consumer | Snapshot image reply (point-to-point). |
-| `_SASS.<feed>.SUB`      | rv_cache → feed  | *`-S` mode only.* SASS3 batch subscription message (wire format below): subject list + QueryFlags, reply inbox for ack/images. Periodic RESUBSCRIBE reassert = lease refresh (`subsc-decay-time` in raicache terms); UNSUBSCRIBE_FLAG on last-listener-gone. |
-| `_RV.INFO.SYSTEM.*`     | rvd → submgr     | Consumed internally by `RvSubscriptionDB` (LISTEN.START/STOP, SESSION.*, HOST.STATUS keepalive → re-query). Not rv_cache's own protocol — and in default mode, the ONLY interest channel: the feed side runs its own submgr. |
+| `_TIC.<subject>`        | feed → rvcache  | Tick/update payload for `<subject>` (RVMSG). Cached, and forwarded to `<subject>` when it has listeners. (SASS3 broadcast-feed role; a full deployment would use `_SASS.<source>.PUB`.) |
+| `<subject>`             | rvcache → consumers | Forwarded tick payload, unchanged (or post-merge image with `route-after-merge` semantics, `-M`). |
+| `_SNAP.<subject>`       | consumer → rvcache | Snapshot RPC. Optional QueryFlags-style `flags` field: absent/SNAPSHOT → image reply (default); SUBSCRIBE\|INITIAL_VALUES → image for a subscribing rv7 client — subscription *life* stays with the advisory refcnt (no `_SNAP` lease). submgr resolves the requester's session from the reply inbox; its `user_id` feeds accounting. |
+| `_INBOX.…` (reply)      | rvcache → consumer | Snapshot image reply (point-to-point). |
+| `_SASS.<feed>.SUB`      | rvcache → feed  | *`-S` mode only.* SASS3 batch subscription message (wire format below): subject list + QueryFlags, reply inbox for ack/images. Periodic RESUBSCRIBE reassert = lease refresh (`subsc-decay-time` in raicache terms); UNSUBSCRIBE_FLAG on last-listener-gone. |
+| `_RV.INFO.SYSTEM.*`     | rvd → submgr     | Consumed internally by `RvSubscriptionDB` (LISTEN.START/STOP, SESSION.*, HOST.STATUS keepalive → re-query). Not rvcache's own protocol — and in default mode, the ONLY interest channel: the feed side runs its own submgr. |
 
 Interest state is restart-proof in both directions: a restarted feed
 rebuilds from the next RESUBSCRIBE cycle (`-S` mode) or from its own
-submgr host/session queries (default mode); a restarted rv_cache rebuilds
+submgr host/session queries (default mode); a restarted rvcache rebuilds
 consumer interest from submgr's queries and reasserts upstream from the
 refreshed `sub_tab`.
 
@@ -223,35 +230,36 @@ refreshed `sub_tab`.
 All within one process, single `EvPoll` — same runtime shape as the other
 sassrv test programs.
 
-### 1. Transports: four `EvRvClient`s
+### 1. Transports: one `EvRvClient` per declared net
 
-One client session per network role (see topology above), all on the one
-`EvPoll`. Base `-d daemon`, `-n network`, `-s service` flags set the
-default for all four; per-role overrides (`-1`..`-4`) replace the triple
-for that attachment. Sessions connect lazily — an attachment whose role is
-disabled (no `-S`, no `-F`) is simply not created.
+One client session per declared attachment (`-<idx> role proto ...` or
+`-c` nets array), all on the one `EvPoll`. Base `-d daemon`, `-n network`,
+`-s service` flags set the default triple; empty per-net d/n/s fields
+fall back to them. Only declared attachments are created; at least one
+sub net is required, and duplicate indexes are rejected.
 
-Subscriptions per session:
+Subscriptions per attachment:
 
-- **net 1 (rv feed):** `_TIC.>` — the feed firehose
-- **net 2 (rv sub):** `_SNAP.>` snapshot RPC; `RvSubscriptionDB` adds its
-  `_RV.INFO.SYSTEM.*` subscriptions and inbox query subjects here when
+- **feed sass2:** `_TIC.>` firehose, or `_TIC.<wild>.>` with a per-net
+  wildcard
+- **feed sass3:** `_SASS.>` filtered on the `.PUB` suffix, or
+  `_SASS.<wild>.PUB`
+- **sub, sass2 channel:** `_SNAP.>` snapshot RPC; `RvSubscriptionDB` adds
+  its `_RV.INFO.SYSTEM.*` subscriptions and inbox query subjects when
   `start_subscriptions()` is called
-- **net 3 (sass3 feed):** reply-inbox only (SUB acks / images); publishes
-  `_SASS.<feed>.SUB`, consumes `_SASS.<feed>.PUB`
-- **net 4 (sass3 sub):** `_SASS.<name>.SUB` — the downstream SASS3 service
-  listener (control plane only); data for net-4-held interest is published
-  as bare `<subject>` on this attachment
+- **sub, sass3 channel:** `_SASS.<wild>.SUB` (unfiltered `_SASS.>`) — the
+  downstream SASS3 service listener (control plane only); data for
+  sass3-held interest is published as bare `<subject>` on this attachment
 
 ### 2. Interest tracking: `RvSubscriptionDB` + listener impl
 
 ```cpp
-struct CacheSubListener : public RvSubscriptionListener {
-  RvCache &cache;
-  virtual void on_listen_start( Start &add ) noexcept; /* first refcnt=1 -> _TIC.START, reply inbox -> initial image */
-  virtual void on_listen_stop ( Stop  &rem ) noexcept; /* refcnt=0 / is_orphan -> _TIC.STOP */
+struct SubCB : public RvSubscriptionListener { /* one per sub net */
+  RvCache &cache;  uint32_t net; /* fwd_mask bit = idx - 1 */
+  virtual void on_listen_start( Start &add ) noexcept; /* refcnt>0 -> set fwd bit; reply inbox -> initial image or miss status */
+  virtual void on_listen_stop ( Stop  &rem ) noexcept; /* refcnt==0 -> clear fwd bit + NOSUBSCRIBERS */
   virtual void on_snapshot    ( Snap  &snp ) noexcept; /* image -> snp.reply */
-  virtual void on_sass3       ( Sass3 &sa3 ) noexcept; /* sass3 interest, net 2 (sassrv f67b8ad) */
+  virtual void on_sass3       ( Sass3 &sa3 ) noexcept; /* sass3 interest channel (sassrv f67b8ad) */
 };
 ```
 
@@ -266,7 +274,7 @@ struct CacheSubListener : public RvSubscriptionListener {
   clients may receive **double initial values**. sass3-aware clients know
   sass3 coexists on sass2 networks and **use sass3 even when only sass2
   exists** — so a sass3-enabled cache must expect sass3 interest from day
-  one. rv_cache enables both channels; whether initials are deduped per
+  one. rvcache enables both channels; whether initials are deduped per
   subject+holder across the two channels or the double-initial is
   accepted is an implementation decision (production clients tolerate a
   duplicate initial). `S3_REFRESH` from a client asks for **another image
@@ -276,26 +284,31 @@ struct CacheSubListener : public RvSubscriptionListener {
   **Separate sass2 and sass3 networks take separate submgr instances** —
   one configured `(all, s2=true, s3=false)`, the other
   `(all, false, true)` — with independent sub_tabs and refcnts; the
-  forwarding gate then ORs the per-submgr refcnt checks (the same
-  fall-through shape §5 describes for the net-4 sass3_db), and each
+  forwarding gate then ORs the per-submgr refcnt checks (materialized
+  per net in `CacheEntry::fwd_mask`), and each
   submgr asserts and broadcasts initials on its own refcnt 0→1
   independently. **Implemented as arbitrary network attachments:**
-  `-<idx> role,proto[,daemon[,network[,service[,wildcard]]]]` (idx 1..64,
-  role `feed|sub`, proto `sass2|sass3|both`, empty d/n/s fields fall back
-  to `-d/-n/-s`), or `-c file` with a json/yaml `nets` array of
-  `{index, role, proto, daemon, network, service, wildcard}` objects.
+  `-<idx> role proto [daemon [network [service [wildcard]]]]`
+  (argv-separated fields running to the next `-flag`; idx 1..64, role
+  `feed|sub`, proto `sass2|sass3|both`, empty-string d/n/s fields fall
+  back to `-d/-n/-s`), or `-c file` with a json/yaml `nets` array of
+  `{index, role, proto, daemon, network, service, wildcard}` objects —
+  the config file also carries every other option as a long-name
+  top-level key (see CLI section; explicit CLI flags override file
+  values).
   The optional per-net `wildcard` scopes the attachment to a subject
   space: on a **sub** net it is passed to that net's submgr as a filter
   for both the sass2 and sass3 interest channels and subscriptions start
   with `all=false` (`_RV.INFO...LISTEN.{START,STOP}.<wild>.>`,
   `_SNAP.<wild>.>`, `_SASS.<wild>.SUB` instead of the firehose); on a
   **feed** net it narrows the upstream subscription to `_TIC.<wild>.>`
-  (sass2) or `_SASS.<wild>.PUB` (sass3, milestone 2). Global `-w`
-  filters still apply to every sub net and combine with the per-net
-  wildcard. Any number
+  (sass2) or `_SASS.<wild>.PUB` (sass3, milestone 2). The per-net
+  wildcard is the only subject filter (the former global `-w` list was
+  dropped: it duplicated per-net wildcards and multiplied the submgr
+  filter set). Any number
   of feed and sub networks; every sub net is one `SubCB` + one submgr,
   differing only in the `start_subscriptions` enables. Default topology
-  when nothing is declared: `-1 feed,sass2 -2 sub,both` (collapsed).
+  when nothing is declared: `-1 feed sass2 -2 sub both` (collapsed).
 - **Forwarding gate = per-net bitmask on the cache entry.**
   `CacheEntry::fwd_mask` holds one forwarding bool per net (bit =
   idx−1): a subscribe callback with `refcnt > 0` sets the net's bit, an
@@ -308,19 +321,20 @@ struct CacheSubListener : public RvSubscriptionListener {
   entry with mask 0 and no image is removed. Inbox replies
   (`_SNAP`/miss/initial-on-listen) and per-net broadcasts (asserted
   initials, NOSUBSCRIBERS) go to the requesting/closing net only.
-- **Asserted interest → broadcast an initial.** When rv_cache discovers
+- **Asserted interest → broadcast an initial.** When rvcache discovers
   interest it did not see arrive — a sass2 subscription-query reply
   (`Start.is_listen_start == false`, no inbox) or a sass3 RESUBSCRIBE
   renewing a holder submgr didn't know (`Sass3.is_asserted`, REFRESH
   OR'd in by submgr, not the client) — those listeners predate the
-  cache (typical at rv_cache startup) and already believe they are
+  cache (typical at rvcache startup) and already believe they are
   subscribed. If the subject just went live (refcnt 1) and an image
   exists, **broadcast an INITIAL on the subject** so every such
   listener converges; nothing goes to any inbox. Cache still cold →
   broadcast nothing: the feed's next INITIAL broadcasts normally.
 
 - Constructed with a wildcard filter (`add_wildcard()`); default is
-  everything except `_`-prefixed subjects, `-w RSF.>` style flag to narrow.
+  everything except `_`-prefixed subjects, the per-net tuple/config
+  `wildcard` field (`RSF.>` style) to narrow.
 - **Wildcard consumers** (a client listening `TEST.>`) follow the
   raicache policy pair, both meanings implemented:
   - `can-wildcard=false`: the wildcard is a **debug/monitoring tap** — the
@@ -346,17 +360,14 @@ struct CacheSubListener : public RvSubscriptionListener {
   matched one of the `_RV.INFO.*` / `_SNAP.>` / inbox-query
   subscriptions** (control traffic: consumed, listener callbacks fired)
   and false otherwise — false means ordinary data, handle it on the data
-  path. Net 4 mirrors the contract: `sass3_db.process_pub( pub )` returns
-  true when it consumed a `_SASS.<name>.SUB` control message.
-- **Forwarding decision** on a `_TIC.<subject>` arrival: read-only
-  `sub_tab.find()` in sub_db — forward when the entry exists with
-  `refcnt != 0`. submgr controls the subscription's whole life (advisory
-  START/STOP, session/host queries, timeout sweeps, GC); rv_cache keeps
-  **no parallel interest table** on the RV side. The read-only find — not
-  `snapshot()`, which find-or-creates — keeps the feed firehose from
-  minting entries for never-listened subjects (see resolved question 1).
-  When net 4 is enabled, a sub_db miss falls through to the same refcnt
-  check against sass3_db.
+  path. The sass3 channel is part of the same contract: submgr consumes
+  `_SASS.<name>.SUB` control messages and fires `on_sass3`.
+- **Forwarding decision** on a `_TIC.<subject>` arrival: read the
+  entry's `fwd_mask` (bullet above) — no per-tick sub_tab lookups, no
+  submgr-table entries minted by the firehose. submgr controls the
+  subscription's whole life (advisory START/STOP, session/host queries,
+  timeout sweeps, GC, sass3 leases); rvcache keeps **no parallel interest
+  table** — the mask is the materialized gate (see resolved question 1).
 - **Interest upstream (`-S` mode, SASS3 lease):** `on_listen_start` with
   refcnt 0→1 sends an immediate SUB message
   (`SUBSCRIBE|INITIAL_VALUES` flags, that subject in the `S` submessage);
@@ -368,7 +379,8 @@ struct CacheSubListener : public RvSubscriptionListener {
   batches issued evenly over the period, so every subject is refreshed
   once per window without a thundering reassert burst; feed acks to the
   reply inbox (`sendAck` path fires on RESUBSCRIBE without IMAGE_FLAGS).
-  In default mode this whole component is absent.
+  In default mode this whole component is absent. *(Milestone 2 — not yet
+  implemented; `-S` is rejected at startup.)*
 - **Initial image on listen (rv5-only, no CLI flag):** `Start.reply`
   non-empty and cache has an image → publish the image (stamped
   `MSG_TYPE = INITIAL`, §3) to the reply inbox. **Miss → status to the
@@ -398,19 +410,28 @@ Keyed by subject; raikv `RouteVec<CacheEntry>` (same pattern submgr uses
 for `sub_tab`), entry holding:
 
 ```cpp
+/* POD: RouteVec Data relocates with raw memmove (no ctors/dtors run),
+ * so the image is a malloc'd raw buffer, never an embedded MDMsgMem */
 struct CacheEntry {
-  uint32_t   subject_id;     /* hash/id parity with submgr optional */
-  uint64_t   update_count,   /* ticks received */
-             forward_count,  /* ticks re-published */
-             snap_count;     /* snapshots served */
-  uint64_t   last_update_ns;
-  uint32_t   last_seqno;     /* SASS seqno when present */
-  uint16_t   msg_type;       /* last MD_SASS msg type seen */
-  md::MDMsgMem mem;          /* owns image bytes */
-  void     * image;          /* latest image blob (RVMSG bytes) */
-  size_t     image_len;
-  uint16_t   len;            /* subject */
-  char       value[ 2 ];
+  uint64_t fwd_mask;       /* per-net forwarding bits (idx-1); set by a
+                            * subscribe with refcnt > 0 on that net,
+                            * cleared by an unsubscribe with refcnt == 0 */
+  uint64_t update_count,   /* ticks received */
+           forward_count,  /* ticks re-published */
+           snap_count;     /* snapshots served */
+  uint64_t last_update_ns;
+  void   * image;          /* latest image blob (RVMSG bytes), malloc'd */
+  size_t   image_len;
+  uint32_t image_enc;      /* md msg encoding of image */
+  uint32_t subject_id;
+  uint32_t last_seqno;     /* SASS seqno when present (16-bit wrap) */
+  uint32_t own_seqno;      /* -Q stamp: cache's own monotonic seqno */
+  uint16_t msg_type;       /* last MD_SASS msg type seen */
+  bool     has_seqno;
+  /* RouteSub trailing members */
+  uint32_t hash;
+  uint16_t len;
+  char     value[ 2 ];
 };
 ```
 
@@ -456,11 +477,11 @@ LISTEN.START or the HOST.STATUS keepalive) and forwarding has stopped — it
 SHOULD reassert its subscription so a fresh advisory fires. In practice
 most clients do nothing and recovery happens from the other side: submgr's
 HOST.STATUS-driven re-query cycle rediscovers the listen and interest
-resumes. Both repair paths coexist; rv_cache emits the signal by default
+resumes. Both repair paths coexist; rvcache emits the signal by default
 so proactive clients get the fast path.
-- No `MSG_TYPE` field → configurable default: `--merge` (treat every tick
-  as a delta) or replace mode (default; cheapest, correct for full-image
-  feeds).
+- No `MSG_TYPE` field → configurable default: merge (default; treat
+  every tick as a delta) or `-r` replace mode
+  (`replace_typeless_msgs`; cheapest, correct for full-image feeds).
 - **MSG_TYPE normalization — first field, fixed size, updated in place:**
   whenever the cache builds or rebuilds an image (INITIAL replace, field
   merge) and the source carries a `MSG_TYPE`, the writer emits it as the
@@ -485,7 +506,7 @@ so proactive clients get the fast path.
     per-subject update seqno and stamps outgoing merged images with it
     (the `RWF_Cache_Seqno` pattern from production) — downstream sees a
     clean monotonic stream regardless of feed behavior.
-  In rv_cache (single feed input) the policy is a CLI flag
+  In rvcache (single feed input) the policy is a CLI flag
   (`-Q observe|strict|stamp`); a multi-source build would hang it off
   per-source config like everything else in this list.
 
@@ -495,7 +516,7 @@ is raikv's shared-memory KV — `HashTab::create_map()` / `attach_map()`
 (`raikv/shm_ht.h`, `EvShm` wrapper) — a **shared-memory-across-process
 model**: the image store lives in a named segment that several processes
 attach and operate on concurrently. That is how raids already works
-(`EvShmClient`), which is the point: an rv_cache can run **alongside a
+(`EvShmClient`), which is the point: an rvcache can run **alongside a
 ds_cache (redis cache)** and future protocol frontends, all serving *one*
 image store — subject as key, image blob + meta (seqno, msg_type,
 timestamps) as value — each process contributing its own protocol view.
@@ -504,9 +525,14 @@ The milestone-1 layout was shaped for this on purpose-by-accident:
 graph, so it maps onto a ht value directly. What stays process-private is
 the *subscription* table — interest is protocol-specific; only images are
 shared. Concurrency comes from the ht's per-entry locking + versioned
-reads (merge becomes read-modify-write under the entry lock). CLI sketch:
-a `-k <map>` flag attaches a segment (raikv facility naming, e.g.
-`sysv:raikv.shm`); absent → private heap table exactly as today.
+reads (merge becomes read-modify-write under the entry lock). The CLI
+end already exists: `-m <map_name>` (config `map_name`) opens/attaches
+the segment at startup (raikv facility naming, e.g. `sysv:raikv.shm`;
+`EvShm` handle constructed and held by `RvCache`); absent or `none` →
+private heap table exactly as today. Wiring the image store onto the
+map is the milestone-3 work. A dictionary (`-p <path>` / `dict_path`,
+default `$cfile_path`, loaded via `MDMsgDict`) rides along for the
+field-aware pieces that shared images and protocol frontends need.
 
 ### 4. Snapshot service
 
@@ -547,10 +573,10 @@ Reply payload: the cached image, `MSG_TYPE` stamped for the delivery kind
 (§3 normalization: `SNAPSHOT` for `_SNAP` replies and SNAPSHOT-flagged
 requests, `INITIAL` for listen-start-inbox pushes and INITIAL_VALUES
 requests — the receiver can tell a poll answer from a subscribe-image),
-plus (in merge mode) rv_cache's own bookkeeping fields appended when `-v`
+plus (in merge mode) rvcache's own bookkeeping fields appended when `-v`
 verbose-images is set (`_cache_seq`, `_cache_time`). The RPC always
 completes; consumers distinguish miss from timeout, and the reply is
-meaningful to any SASS-aware client, not just rv_cache's own tooling.
+meaningful to any SASS-aware client, not just rvcache's own tooling.
 
 **Cold-cache misses — the pending-initial flow.** What a miss reply says
 depends on what kind of source stands behind the cache:
@@ -572,41 +598,40 @@ depends on what kind of source stands behind the cache:
   status and interest remains asserted upstream, so a very-late initial
   still broadcasts normally.
 
-### 5. SASS3 downstream service: `Sass3SubscriptionDB` (network 4, `-F name`) — not yet implemented
+### 5. SASS3 downstream service — implemented via submgr's sass3 channel
 
-The mirror image of `-S` mode: rv_cache advertises itself as a SASS3 feed
-named `<name>` for legacy clients. Structured as a second interest
-database, `sass3_db`, deliberately shaped after sub_db: the same
-`process_pub()` dispatch contract (returns true when it consumed a
-`_SASS.<name>.SUB` control message, parsed per
+The downstream SASS3 service is not a separate database: submgr's sass3
+interest channel (the `IS_SASS` wildcard subscription on any `sub sass3`
+or `sub both` net) parses `_SASS.<name>.SUB` per
 `Sass3SubscribeConsumer::onMsg()` semantics — magic 23176, QueryFlags in
-`T`, subjects as field names of `S`), the same `RouteVec` subscription
-table, the same refcnt-gated forwarding check, the same listener-callback
-surface feeding accounting. The differences are all consequences of SASS3
-having no advisory channel:
+`T`, subjects as field names of `S` — and fires the `on_sass3` callback
+per subject. The consequences of SASS3 having no advisory channel are
+handled inside submgr:
 
 - **QueryFlags manage the refcnt.** `SUBSCRIBE` refs the sender's holder
   on each subject listed in `S`; `UNSUBSCRIBE` derefs; `RESUBSCRIBE`
   renews the holder's lease without changing the count.
-- **The hold timer is internalized here.** Every holder ref carries a
-  lease stamped from the `-D` clock; a lease not renewed by RESUBSCRIBE
-  within the window expires and derefs. This is the ONLY decay timer in
-  rv_cache — the RV side needs none, because advisories provide explicit
-  STOP. Nothing outside sass3_db sees or manages leases.
+- **The hold timer is internalized in submgr.** Every holder ref carries
+  a lease; a lease not renewed by RESUBSCRIBE within the window expires
+  and derefs — it surfaces as an UNSUBSCRIBE callback with `is_asserted`
+  set, logged with `reason: hold_timer`. This is the ONLY decay timer —
+  the RV side needs none, because advisories provide explicit STOP.
 - SASS3 holders are identified by the `A` accounting submessage
-  (user/host/app/pid); the `H` host attribution also enables
-  host-correlated early expiry (see the ghost-window rule in the topology
-  section) — the hold timer is the backstop, not the common case.
-- `IMAGE_FLAGS` (SNAPSHOT/INITIAL_VALUES) → cached images to the reply
-  inbox, `MSG_TYPE` stamped to match the flag (`SNAPSHOT` vs `INITIAL`,
-  §3/§4); miss → TRANSIENT/NOT_FOUND, same one-code-path as `_SNAP`.
+  (user/host/app/pid → `RvSass3Entry`); the `H` host attribution also
+  enables host-correlated early expiry (see the ghost-window rule in the
+  topology section) — the hold timer is the backstop, not the common case.
+- `IMAGE_FLAGS` (SNAPSHOT/INITIAL_VALUES) and `REFRESH` → cached image to
+  the reply inbox, `MSG_TYPE` stamped to match the flag (`SNAPSHOT` vs
+  `INITIAL`, §3/§4); miss → TRANSIENT/NOT_FOUND, same one-code-path as
+  `_SNAP`.
 - Ack to reply inbox when RESUBSCRIBE without IMAGE_FLAGS (matching
   `sendAck`).
 - **Data delivery is plain RV:** subscribers listen on the bare
-  `<subject>`; rv_cache publishes accepted ticks there exactly as it does
-  for native consumers. No PUB envelope is emitted — that envelope is the
-  *feed-side* broadcast format (a role rv_cache would only take on when
-  cascading cache-to-cache, out of scope for the first cut).
+  `<subject>`; rvcache publishes accepted ticks there via `fwd_mask`
+  exactly as it does for native consumers. No PUB envelope is emitted
+  downstream — that envelope is the *feed-side* broadcast format
+  (consumed by `feed sass3` nets; emitting it is a cascading
+  cache-to-cache role, out of scope for the first cut).
 
 ### 6. Stats
 
@@ -621,7 +646,7 @@ from `SESSION.START`/`userid` and subscription-query replies), track subjects he
 served, subscription open/close times. This is the audit surface a feed
 vendor's billing collection expects; in-memory counters with a
 dump-on-exit / on-demand print, plus the structured log below — the point
-is that the identity plumbing exists from day one, not that rv_cache does
+is that the identity plumbing exists from day one, not that rvcache does
 billing.
 
 **Structured accounting log (`-A file`, JSONL):** one JSON object per
@@ -666,55 +691,77 @@ chosen exactly so jq/logrotate/collectors handle it downstream.
 
 ## CLI
 
+Only the important knobs are CLI flags; everything else is config-file
+only (there would be too many flags otherwise). Net tuple fields are
+argv-separated — a network config (`eth0;227.5.0.0,227.5.0.1`) can
+contain commas, so comma-joined tuples cannot carry them. Tuple fields
+run to the next `-flag`; pass `''` to skip a middle field (falls back
+to `-d/-n/-s`).
+
 ```
-rv_cache [-d daemon] [-n network] [-s service]   defaults for all 4 networks
-         [-1 d,n,s]        rv feed override      (data in, _TIC.>)
-         [-2 d,n,s]        rv sub override       (data out, _SNAP, submgr)
-         [-3 d,n,s]        sass3 feed override   (-S upstream client)
-         [-4 d,n,s]        sass3 sub override    (-F downstream service)
-         [-w wildcard]     subject filter for interest tracking (repeatable)
-         [-S feed]         enable SASS3 legacy-compat mode: resubscribe to
-                           _SASS.<feed>.SUB, consume _SASS.<feed>.PUB envelopes
-                           (default: off -- rvd-native, no upstream protocol)
-         [-F name]         serve downstream SASS3 subscription maint on
-                           _SASS.<name>.SUB (data flows on bare subjects;
-                           default: off; <name> must differ from -S <feed> when
-                           the sass3 attachments share network parameters)
-         [-D secs]         SASS3 hold timer, sass3 nets only (internal to
-                           sass3_db / the -S reassert cycle): upstream
-                           reassert window + downstream lease decay (default
-                           480 = 8 min, the customary SASS3 hold time;
-                           reasserts spread across the window). No effect
-                           without -S/-F: RV-side subscription life is
-                           submgr's, advisory-driven, timerless
-         [-m]              merge mode default for typeless ticks
-         [-Q mode]         seqno policy: observe | strict | stamp (default observe)
-         [-M]              route-after-merge: forward merged image, not raw tick
-         [-x secs]         stale entry expiry (0 = never, default 0)
-         [-P secs]         -S mode: pending-initial timeout (default 10)
-         [-A file]         structured accounting log, JSONL (- for stdout;
-                           default off)
-         [-q]              quiet stats
-         [-v]              verbose (submgr mout debug log to stdout)
+rvcache [-d daemon] [-n network] [-s service]   defaults for all nets
+        [-<idx> role proto [daemon [network [service [wildcard]]]]]
+                          net attachment, repeatable: idx 1..64, role
+                          feed|sub, proto sass2|sass3|both.  e.g.
+                          -1 feed sass2 -2 sub sass2
+                          -4 sub sass3 tcp:7501 '' 7501 'RSF.>'
+        [-c file]         json/yaml config (.yaml/.yml = yaml): long-name
+                          top-level keys — daemon, network, service,
+                          nets: [{index,role,proto,daemon,network,
+                          service,wildcard},...], map_name, dict_path,
+                          replace_typeless_msgs, sequence_policy,
+                          route_after_merge, message_eviction_secs,
+                          pending_initial_secs, accounting_file, quiet,
+                          verbose.  A bare top-level array is read as the
+                          nets list.  Explicit CLI flags override file
+                          values.  Default topology when no nets are
+                          declared: -1 feed sass2 -2 sub both
+        [-m map_name]     shm to cache msgs (raikv naming, e.g.
+                          sysv:raikv.shm; milestone 3 wires the store)
+        [-p path]         dictionary search path (default $cfile_path)
+        [-r]              replace typeless ticks (default: merge)
+        [-Q mode]         seqno policy: observe | strict | stamp (default observe)
+        [-M]              route-after-merge: forward merged image, not raw tick
+        [-x secs]         message eviction expiry (0 = never, default 0)
+        [-P secs]         -S mode: pending-initial timeout (default 10)
+        [-A file]         structured accounting log, JSONL (- for stdout;
+                          default off)
+        [-q]              quiet stats
+        [-v]              verbose (submgr mout debug log to stdout)
 ```
+
+*Planned, milestone 2 (not in the current CLI — the Config fields were
+removed 2026-07-23 and come back with the implementation):* `-S feed`,
+the SASS3 upstream subscription-maintenance client (batch resubscribe to
+`_SASS.<feed>.SUB`; the passive `_SASS.<feed>.PUB` envelope consumer is
+a `feed sass3` net and already works), and `-D secs`, its reassert
+window (default 480 = 8 min, the customary SASS3 hold time; reasserts
+spread across the window). `-D` is SASS3-protocol plumbing and belongs
+to the `-S` client; the downstream lease window is submgr-internal at
+480s. `-P` stays in the CLI now: the pending-initial table is generic
+to every interactive-feed type — sass3 is just the first upstream that
+can be asked. A separate `-F name` flag was dropped: plain `sub sass3`
+nets already serve `_SASS.<name>.SUB` interest, scoped by the per-net
+wildcard when needed; the self-loop guard (upstream feed name must
+differ from the downstream advertised space on shared parameters) moves
+to `-S` validation.
 
 ## Repo layout
 
 Mirror `rvcount` (standalone injinj project):
 
 ```
-rv_cache/
-  GNUmakefile          # link order: -lsassrv -lraimd -lraikv (+ static push/pop
-                       # state per rvcount's lnk_lib), includes from
-                       # $(sassrv_home)/include etc.
-  src/rv_cache.cpp     # main: poll loop, EvRvClient wiring, dispatch
-  src/cache_tab.cpp    # CacheEntry table + merge logic
+rvcache/
+  GNUmakefile          # link: -lsassrv -lraimd -ldecnumber -lraikv -lz
+  src/rv_cache.cpp     # main: poll loop, net attachments, dispatch, CLI
+  src/cache_tab.cpp    # CacheEntry table + merge/normalize logic
   include/rvcache/cache.h
-  test/                # scripted integration tests (below)
-  rpm/rv_cache.spec    # BuildRequires: raikv-devel, raimd-devel, sassrv-devel
+  test/basic.sh        # scripted integration tests (below)
+  rpm/rvcache.spec     # BuildRequires: raikv-devel, raimd-devel, sassrv-devel
   deb/                 # control mirrors rpm deps
-  .copr/Makefile       # same pattern as other repos (with the _ensure_git
-                       # one-liner from the 2026-07-09 COPR fix)
+  .copr/Makefile       # COPR build entry (same pattern as other repos)
+  build_depends.mak    # pinned upstream build deps
+  cache.yaml           # example -c nets config
 ```
 
 ## Test plan
@@ -722,8 +769,14 @@ rv_cache/
 Integration harness (shell script in `test/`), using sassrv's own rvd-compatible
 server so no TIB install is needed:
 
+> **Status:** `test/basic.sh` currently covers 1 (as test 3 below), 4, 5,
+> 6b, 6c (rv7 flagged `_SNAP` miss), 6d (sass3 interest channel), 6e
+> (separate sass3 net), 6f (sass3 PUB-envelope feed), and 7. The
+> remaining numbered tests are pending; 3b/7c need milestone 2 (`-S`),
+> test 8 needs the can-wildcard implementation.
+
 1. Start sassrv rv server (or real rvd) on a private service/network.
-2. Start `rv_cache -m`.
+2. Start `rvcache` (typeless-tick merge is the default).
 3. **Interest, default mode:** run a second `RvSubscriptionDB` instance as
    the "feed's view" (this is the recommended topology, so test it as
    such); start a consumer on `TEST.FOO`; assert the feed-side submgr sees
@@ -809,7 +862,7 @@ server so no TIB install is needed:
    other; refcnt hits 0 only when both are gone.
 12. **Collapsed networks:** run all four attachments with identical
    `d,n,s` on one service (this is also how tests 1–11 run by default) —
-   assert no self-loop: rv_cache never consumes its own forwards or
+   assert no self-loop: rvcache never consumes its own forwards or
    envelopes; startup rejects `-S X -F X` when nets 3/4 share parameters.
 13. **Session-model matrix:** same-subject interest from an rv5-style
    client (`rv5_api_test`/`rv_client`), an rv7-style client (`subrv7test`),
@@ -884,11 +937,11 @@ QueryFlags (`cache_if.h`): `SNAPSHOT 0x01`, `SUBSCRIBE 0x02`,
 | `E`   | uint | expires |
 | `A`/`G` | —  | acct/group (ignored by doFeed) |
 
-rv_cache `-S` mode emits SUB messages byte-compatible with `onMsg()` and
+rvcache `-S` mode emits SUB messages byte-compatible with `onMsg()` and
 parses PUB envelopes per `doFeed()`; default `_TIC.>` mode carries bare
 RVMSG payloads with SASS `MSG_TYPE`/`SEQ_NO` fields inline instead.
 
-**Implemented (feed,sass3 nets):** the PUB-envelope consumer
+**Implemented (feed sass3 nets):** the PUB-envelope consumer
 (`on_sass3_feed_msg`). Requires `M` = 23177; `T` overrides the payload's
 `MSG_TYPE` when present; each `D` field (name = data subject, value =
 opaque message bytes) enters the cache through the same `handle_tic`
@@ -911,6 +964,166 @@ services infrastructure (`_SASS.SERVICES.LIST` dictionary requests), DQA
 heartbeats (`_SASS.DQA.TIC.HB`). Listed so the test can grow toward the
 real thing without renaming anything.
 
+## Milestone 3 design notes — bloom-gated forwarding, batched shm merges, prefetch (2026-07-26)
+
+When the image store moves into raikv shm (`-m <map_name>`, TODO Milestone
+3), every tick's merge becomes a hashed probe into the shm ht plus a
+read-modify-write of segment memory under the entry lock — two dependent
+cache misses per tick on memory the CPU cannot predict. raids already
+built the machinery for hiding exactly this latency (`EvKeyCtx` +
+`EvPrefetchQueue` + `EvPoll::drain_prefetch()`, a `PREFETCH_SIZE=8`
+software pipeline), but interleaving it with redis network traffic gave
+mixed results: redis couples every key to a client waiting for a reply,
+so batching bought throughput by selling tail latency, and single-key
+commands paid queue overhead for nothing. The tick path here has neither
+problem — batches arise naturally from the recv drain and nobody waits
+on a cache merge — provided the forward decision is split off first.
+
+### Split the tick path: forward now, merge later
+
+```
+tick → parse subj → bloom probe ── hit ──→ forward raw bytes    (ns path, no shm)
+                        │
+                        └────→ batch[] → coalesce per subj
+                                  → prefetch → merge into shm    (idle path)
+snapshot req → drain subject's pending deltas → stamp + serve    (rare, sync)
+```
+
+Forwarding is unmolested bytes, so it needs no cache state at all — on a
+bloom hit the tick is re-published *before* its merge happens. A false
+positive forwards a tick nobody asked for and rvd/rv_server filters it by
+exact interest; the bloom's one-sided error is therefore purely a
+bandwidth cost, never a latency or correctness cost. The merge then joins
+every other tick (hit or miss) on the batch path, which runs with zero
+latency constraint — the regime where the raikv prefetch pipeline
+demonstrably wins (`test/bench.cpp` `BM_Insert4`/`BM_Iterate4`,
+`prefetch_array(4)`).
+
+### Interest bloom
+
+- One `BloomBits` (raikv `bloom.h` — same structure raims uses for
+  routing interest) per forwarding net, probed in sequence; nets are few
+  and the probes are L1-resident bit tests. `CacheEntry::fwd_mask`
+  remains the authoritative per-net interest — the blooms are a
+  front-end that lets the hot path decide *without touching the entry*.
+- Maintained on the same submgr subscribe/unsubscribe edges that set and
+  clear `fwd_mask` (refcnt 0→1 adds, 1→0 removes). Plain blooms cannot
+  delete: on 1→0 either count (counting bloom) or tolerate stale
+  positives — a stale positive is an unnecessary forward that rvd
+  filters, so lazy rebuild (timer, or after N removals) is sufficient.
+- Wildcard interest must enter the bloom as its match domain or force
+  that net into dense mode (forward everything); per-subject membership
+  cannot answer a pattern. Dense interest (subscriber-of-everything)
+  degrades gracefully: every tick is a hit, which is today's behavior.
+
+### Batch, coalesce, prefetch (merge path)
+
+- **Batch = the recv drain.** One EvPoll wakeup hands N pending ticks;
+  no artificial queuing. Depth is self-clocking — it grows with feed
+  rate, exactly when overlap pays; an idle feed produces batch=1 and the
+  prefetch phase is skipped (gate: batch < ~4 → merge directly). This
+  avoids the raids failure mode of paying queue overhead on singles.
+- **Coalesce per subject before touching shm.** Chain same-subject
+  deltas in arrival order; acquire the entry once, apply the chain,
+  release once. A replace-type tick (INITIAL / `replace_typeless`) drops
+  earlier queued deltas for that subject outright. For hot subjects this
+  divides lock traffic and write-backs by the burst factor — likely
+  worth more than the prefetch itself.
+- **Two-phase pipeline over the distinct subjects:** phase 1 issues
+  `prefetch_array`-style prefetches of the ht positions (prefetch for
+  write — acquire dirties the entry either way); phase 2 walks the batch
+  doing acquire → merge → release, one entry lock held at a time (no
+  multi-hold ⇒ nothing to deadlock against other rvcache processes on
+  the same map). If profiling shows the *segment* read (the old image)
+  dominating rather than the ht probe, raikv's `prefetch_segment`
+  (`test/load.cpp`) supports a depth-2 stagger — prefetch subject j's
+  segment while merging j−1. Measure phase 1 alone first.
+- **Flush triggers:** poll idle, batch-size cap, and snapshot requests
+  (below). Worst-case image staleness is bounded by one poll cycle.
+
+### Ordering invariants
+
+1. **Per-subject FIFO forwarding is preserved** — forwarding happens
+   inline in arrival order on one thread; only the *merge* is deferred.
+2. **Snapshot serves drain first.** Forward-before-merge opens a window
+   where a tick is on the wire but not yet in the image; a snapshot
+   served inside that window would be missing a delta the requester will
+   never see again (it was forwarded before they joined). Therefore: a
+   snapshot serve MUST apply the subject's pending coalesced deltas (or
+   simply drain the whole batch — snapshots are rare) before reading the
+   image. This invariant looks removable under load; it is not.
+3. **Client-side reconciliation stays necessary anyway** because the
+   network can reorder initial-vs-updates on its own: where cache tports
+   are separate from the client mesh (gru's `network.yaml`: raicache on
+   dedicated `primary_*`/`secondary_*` tports, subjects hash-spread
+   across the 4-wide `a..d_mesh`), the `_INBOX` reply and the subject
+   stream cross different queueing domains and the initial arrives 1–2
+   updates late at ~1e-3 rate, rising with load. Two remedies, both
+   compatible with unmolested forwarding:
+   - *Replay rule (no protocol change):* subscriber buffers updates from
+     subscribe until the initial arrives, then applies the buffer in
+     arrival order on top of it. Correct for pure last-value/field-merge
+     semantics given per-subject FIFO + idempotent field overwrite; also
+     absorbs invariant-2's staleness window from the client's view.
+   - *Seqno reconciliation (required for non-idempotent deltas):* when
+     payloads carry a SASS seqno the image inherits the last-merged one
+     (`CacheEntry::last_seqno` / `-Q` `own_seqno` stamping), and the
+     client replays only `seq > image.seq`. Partials, appends, and
+     aggregates get no correctness from the replay rule alone.
+4. **Path pinning (raims-side companion, not rvcache work):** the
+   structural fix for the topology skew is pinning the `_INBOX` reply to
+   the subject's `path_select(subj_hash)` so both flows share one
+   queueing domain — precedent exists (control class pinned to path 0
+   because LISTEN.START/STOP are not idempotent against SESSION/HOST
+   ordering; `EvPublish.shard` as an in-struct routing hint; per-path
+   inbox seqno tracking already in `session.cpp`). The responder can
+   compute the pin from the subject in the request — no wire change.
+   Pinning removes topology-induced reorder; it does not remove the
+   invariant-2 race, which is why both layers exist.
+
+### RWF / OMM nets: the cached element is the field list
+
+RWF (via `~/injinj/omm`) is a different net type with a different shape:
+the delivery kind is not a MSG_TYPE *field* but the envelope
+(`RwfMsgHdr.msg_class`: REFRESH / UPDATE / STATUS), and in
+MARKET_PRICE_DOMAIN the payload is an `RwfFieldListHdr` name-value list.
+The internal contract already exists: `EvOmmConn::publish_msg` forwards
+the whole RWF message as `RWF_MSG_TYPE_ID` with `EvPublish.hdr_len =
+header_size + 2` delimiting the envelope prefix.
+
+- **Ingest:** peek `RwfMsgPeek::get_msg_class()` on the prefix in place
+  of the MSG_TYPE sniff — REFRESH ⇒ is_initial (replace), UPDATE ⇒
+  is_update (merge), STATUS ⇒ transient; envelope `seq_num` feeds the
+  seqno policy.  **Cache `msg + hdr_len`** — the bare field list — with
+  HashEntry type byte `(uint8_t) RWF_FIELD_LIST_TYPE_ID`.  The envelope
+  is delivery metadata and never enters the cache.
+- **Merge:** field-list × field-list through the codec-generic
+  `build_merge` (`MDMsg::create_writer()`).  Wiring gap: `build_merge`
+  currently unpacks with a NULL dict; RWF field iteration needs the
+  loaded `MDMsgDict` (`-p`) — hand CacheTab the dict pointer.
+- **Serve:** the RWF analogue of MSG_TYPE stamping is **envelope
+  construction**, not field mutation: wrap the cached field list in a
+  solicited REFRESH (requester's stream_id, state from cache health).
+  Until that lands, `stamp_msg_type` no-ops harmlessly on field lists
+  (no MSG_TYPE → served as-is).
+- **normalize_msg_type is structurally safe for RWF:** it only rebuilds
+  when a MSG_TYPE field exists but is misplaced; field lists are
+  typeless and take the store-as-is early-out byte-identical.  The
+  RVMSG-conversion caveat applies only to RV-family messages.
+- Forward path is unchanged: updates forward with their envelope intact
+  (unmolested), which keeps the bloom-gated forward-first design; only
+  the merge slices at `hdr_len`.
+
+### What decides if it's worth it
+
+The subscribed fraction of feed traffic. At 5% interest, 95% of ticks
+take only the batch path and the bloom saves an entry probe per tick; at
+dense interest every tick forwards (as today) and the win reduces to
+coalescing + prefetch on the merges. Keep it optional like the raids
+queue (`EvPoll::init(..., prefetch)`) — and for the same reason: memory
+latency in core-cycles keeps growing, so the option ages well even where
+it starts marginal.
+
 ## Open questions — resolved
 
 1. **Forward lookup without entry creation** *(re-resolved — submgr owns
@@ -918,15 +1131,15 @@ real thing without renaming anything.
    `sub_tab` via `RvSubscriptionDB::snapshot()`, which find-or-creates —
    the full feed firehose would mint entries for every never-listened
    subject and bloat the table to the feed universe. An earlier draft
-   answered this with an rv_cache-owned "unified interest table" merging
+   answered this with an rvcache-owned "unified interest table" merging
    advisory + flagged-`_SNAP` + SASS3 holders under keepalive timers; that
-   design is dropped. Resolution: the hot path does a **read-only
-   `sub_tab.find()`** against sub_db and gates on
-   `RvSubscription::refcnt != 0` — no entry creation, no parallel table;
-   submgr's advisory lifecycle (STOP derefs, session/host sweeps, GC) IS
-   the subscription's life. SASS3 interest never touches sub_db: it lives
-   in the mirror-shaped sass3_db with its leased refcnt and internalized
-   hold timer. submgr already grew what this needs:
+   design is dropped. Resolution: subscribe/unsubscribe callbacks
+   materialize interest into `CacheEntry::fwd_mask` and the hot path
+   reads the mask — no per-tick lookups, no submgr entries minted by the
+   firehose, no parallel table; submgr's advisory lifecycle (STOP derefs,
+   session/host sweeps, GC) IS the subscription's life. SASS3 interest
+   lives in the same submgr's sass3 channel with its leased refcnt and
+   internalized hold timer. submgr already grew what this needs:
    `process_pub()` returns consumed/not-consumed, `RvSessionEntry` carries
    `user_id`, and `_SNAP` resolves the requester's session for the
    `on_snapshot` callback.

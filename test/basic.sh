@@ -64,8 +64,8 @@ echo "--- rv_subtop.log ---"; sed -n '1,12p' "$TMP/top.log"
 
 # ---------------------------------------------------------------------------
 # start rv_cache for the remaining tests
-echo; echo "### starting rv_cache -m -A (accounting to file)"
-"$RVC" $DNS -n "" -m -A "$TMP/acct.jsonl" >"$TMP/rvc.log" 2>&1 &
+echo; echo "### starting rv_cache -A (accounting to file; typeless merge is default)"
+"$RVC" $DNS -n "" -A "$TMP/acct.jsonl" >"$TMP/rvc.log" 2>&1 &
 pids+=($!)
 sleep 2
 
@@ -217,7 +217,7 @@ if [ -x "$S7" ] && strings "$S7" | grep -q sass3; then
   sleep 1
   # 3 nets via json config: feed + sass2-only sub on PORT, sass3-only sub
   # on PORT2 (exercises -c and the arbitrary-nets path; equivalent CLI:
-  # -1 feed,sass2 -2 sub,sass2 -4 sub,sass3,tcp:$PORT2,,$PORT2)
+  # -1 feed sass2 -2 sub sass2 -4 sub sass3 tcp:$PORT2 '' $PORT2)
   cat >"$TMP/nets6e.json" <<EOF
 { "nets": [
   { "index": 1, "role": "feed", "proto": "sass2" },
@@ -226,7 +226,7 @@ if [ -x "$S7" ] && strings "$S7" | grep -q sass3; then
     "daemon": "tcp:$PORT2", "service": "$PORT2" }
 ] }
 EOF
-  "$RVC" $DNS -n "" -c "$TMP/nets6e.json" -m >"$TMP/rvc6e.log" 2>&1 &
+  "$RVC" $DNS -n "" -c "$TMP/nets6e.json" >"$TMP/rvc6e.log" 2>&1 &
   pids+=($!)
   sleep 2
   # sass3 subscriber on net 4 (second server)
@@ -276,7 +276,7 @@ fi
 echo; echo "### Test 6f: sass3 feed (_SASS.<feed>.PUB envelope consumer)"
 REPLAY="$SASS/replayrv"
 if [ -x "$REPLAY" ]; then
-  "$RVC" $DNS -n "" -1 feed,sass3 -2 sub,sass2 >"$TMP/rvc6f.log" 2>&1 &
+  "$RVC" $DNS -n "" -1 feed sass3 -2 sub sass2 >"$TMP/rvc6f.log" 2>&1 &
   pids+=($!)
   sleep 2
   timeout 12 stdbuf -oL "$CLI" $DNS -n "" -x F3.REC.T6F >"$TMP/cli6f.log" 2>&1 &
