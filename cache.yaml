@@ -1,0 +1,47 @@
+# rvcache config (-c).  Only the important knobs are CLI flags; every
+# option has a top-level key here, and explicit CLI flags override file
+# values.  Quote numeric strings (service: "7500").
+
+# base (d,n,s) triple, fills empty per-net fields         (-d -n -s)
+daemon: tcp:7500
+#network: ""
+#service: "7500"
+
+# storage
+#map_name: sysv:raikv.shm  # -m  shm msg cache (unset = process-private)
+#dict_path: /usr/adh/lib   # -p  dictionary search path (default $cfile_path)
+
+# cache behavior
+replace_typeless_msgs: false  # -r  replace typeless ticks (default merge)
+sequence_policy: observe      # -Q  observe | strict | stamp
+route_after_merge: false      # -M  forward merged image, not raw tick
+message_eviction_secs: 0      # -x  idle entry eviction (0 = never)
+pending_initial_secs: 10      # -P  pending-initial timeout (interactive feeds)
+
+# output
+#accounting_file: "-"         # -A  accounting jsonl (- = stdout)
+quiet: false                  # -q  quiet stats
+verbose: false                # -v  submgr mout debug log
+
+# net attachments (-<idx> role proto [daemon [network [service [wildcard]]]])
+nets:
+  - index: 1
+    role: feed
+    proto: sass2
+    service: 7500
+    wildcard: RSF.>
+  - index: 2
+    role: sub
+    proto: sass2
+    service: 7600
+    wildcard: RSF.>
+  - index: 3
+    role: feed
+    proto: sass3
+    service: 7700
+    wildcard: RSF.>
+  - index: 4
+    role: sub
+    proto: sass3
+    service: 7800
+    wildcard: RSF.>
