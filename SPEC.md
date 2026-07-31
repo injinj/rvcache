@@ -1124,6 +1124,192 @@ queue (`EvPoll::init(..., prefetch)`) — and for the same reason: memory
 latency in core-cycles keeps growing, so the option ages well even where
 it starts marginal.
 
+## Milestone 4 design — OMM protocol endpoint (2026-07-31)
+
+An OMM net attachment has two sides, mirroring the RV split that already
+exists (broadcast/interactive feed vs. sub):
+
+- **feed side** — rvcache is an OMM *consumer*: connects out to an
+  upstream provider (ADS or `omm_server`), subscribes per interest,
+  caches what comes back.  Detailed below; this is the near-term work.
+- **client side** — rvcache is an OMM *provider*: accepts consumers the
+  way `omm/src/server.cpp` + `ev_omm.cpp` manage them (login accept,
+  source-directory publish, dictionary serve, per-client stream tables).
+  Sketched at the end; own spec pass when it lands.
+
+### Feed side: `EvOmmClient` net
+
+**Net declaration.**  New proto `omm` in the net tuple / config nets
+array: `-<idx> feed omm <host:port> <service> [wildcard]` — `daemon`
+maps to the ADS/provider address (default port 14002), `service` is the
+OMM service name resolved against the source directory (the equivalent
+role the sass3 `<feed>` name plays), `network` is unused.  Config-file
+keys for the login attributes `EvOmmClientParameters` already carries:
+`user`, `app_id`, `app_name`, `instance_id`, `token` (CLI stays lean —
+config file only, like the other long-name knobs).
+
+**Transport lifecycle.**  One `EvOmmClient` per omm feed net,
+constructed over the shared `OmmDict` + a per-net `OmmSourceDB`.
+rvcache always passes an `OmmClientCB` — with a callback set the client
+does NOT self-attach as RouteNotify, so subscription control stays with
+rvcache's own interest engine (same ownership model as the sass3
+upstream mode; `rv_submgr.cpp` is the in-tree example of driving it).
+The client runs the admin handshake internally on fixed streams (login
+1, directory 2, dictionary 3 / enumdefs 4); the net is **ready** only at
+`on_connect`, which fires after the directory (and dictionary, when
+requested) resolve.  Interest replay happens at ready, never at TCP
+connect.
+
+**Dictionary policy.**  RWF field lists are fid-keyed; merge and serve
+need fid→name resolution.  If `-p` loaded a local RDM dictionary, set
+`no_dictionary` and use it.  Otherwise let the client download
+RDMFieldDictionary/enumtypes on streams 3/4 at first connect and adopt
+that as the process dictionary.  A feed net without any dictionary
+refuses to start — a fid-blind cache can still merge (fids are the
+merge keys either way) but cannot serve sass-stamped RV conversions, so
+fail loudly rather than half-work.
+
+**Interest mapping (interactive-feed pattern).**  Identical lifecycle to
+the sass3 upstream channel:
+
+- submgr refcnt 0→1 on a subject (any sub net, gated by this net's
+  wildcard filter) → `subscribe(subj)` → streaming request; the
+  pending-initial timer (`-P pending_initial_secs`) already covers the
+  no-refresh-arrives case with NOT_FOUND to waiting inboxes.
+- refcnt 1→0 → `unsubscribe(subj)` (stream close).  submgr still owns
+  the subscription's life; the omm stream is just its upstream shadow.
+- `_SNAP` on a subject with no live interest → `send_snapshot()`
+  (non-streaming request): serve the refresh to the inbox, cache the
+  image, let eviction (`-x`) age it out.  Parallels the sass3 initial.
+- Subject naming: the cache subject IS the RIC (`RSF.REC.^DJI.NaE`);
+  the net's `service` names the OMM service.  No per-subject service
+  prefixes in v1 — one service per net attachment; attach the same
+  provider twice for two services.  `send_subscribe` returning false
+  ("no source matches") = service down/unknown → treat like feed-down:
+  interest stays registered, replay when the directory announces it.
+- Wildcards cannot subscribe upstream (OMM has no pattern streams); a
+  sub-net wildcard only gates eligibility, exactly as today.
+
+**Data path** (this instantiates SPEC §"RWF / OMM nets" — the cached
+element is the field list):
+
+- `on_omm_msg(sub, len, hash, RwfMsg&)` per message.  Envelope class
+  drives the tick-path decision in place of the MSG_TYPE sniff:
+  - `REFRESH_MSG_CLASS` ⇒ is_initial: replace image.  Multi-part
+    refreshes accumulate; the image is complete at REFRESH_COMPLETE
+    (partial refresh parts merge like updates until then).
+  - `UPDATE_MSG_CLASS` ⇒ is_update: field-merge into the cached list.
+  - `STATUS_MSG_CLASS` ⇒ state-mapped: CLOSED / CLOSED_RECOVER ⇒ evict
+    + transient NOT_FOUND to listeners (DROP analogue); suspect/stale
+    ⇒ forward the status, keep the image.
+- Cache the **payload field list** (envelope stripped), HashEntry type
+  byte `(uint8_t) RWF_FIELD_LIST_TYPE_ID`; envelope `seq_num` feeds the
+  seqno policy fields.
+- Forwarding is cross-codec by nature here: RV sub nets can't use the
+  RWF envelope, so omm-fed subjects forward the **merged image** (the
+  `route_after_merge` path becomes the natural default for omm feeds)
+  through the existing serve/convert machinery; a future omm client
+  side forwards UPDATE envelopes as-is.  The bloom-gated forward-first
+  design still applies to same-codec paths only.
+
+**Reconnect.**  `EvConnectionNotify::on_shutdown` marks the net down;
+timer-driven reconnect with backoff.  Stream ids are per-connection
+(`next_stream_id` resets), so on ready, replay every subject with live
+interest under this net's wildcard — the submgr table is the source of
+truth, same shape as the sass3 RESUBSCRIBE batching resolution (batch
+the replays, don't burst thousands of requests in one write).
+
+**Stats/accounting.**  Existing per-net counters apply; `acct_event`
+protocol tag `"omm"`; add refresh/update/status counts per net (maps
+onto initials/updates already tracked).
+
+### Client side: `EvOmmListen` net — serving OMM clients from sass feeds
+
+rvcache as OMM *provider*: OMM consumers connect, open item streams, and
+are fed from the cache + the sass2/sass3 tick flow.  `omm_server`
+(`server.cpp` + `ev_omm.cpp` + `sub.cpp`) is the skeleton — `EvOmmConn`
+already implements the hard parts (login accept, per-client
+stream/subject tables, solicited-refresh gating, per-connection
+stream_id rewrite, fragmentation); rvcache adds the interest glue and
+the sass→RWF converter.
+
+**Net declaration.**  `-<idx> sub omm <listen-addr:port> <service>` — a
+sub-role net whose daemon slot is the listen address and whose service
+slot names the ONE service rvcache announces in its source directory
+(the cache is the service; service id configurable, default 1).
+Requires the RDM dictionary (`-p` or a dictionary-bearing omm feed net):
+RV→RWF conversion needs fname→fid.  No dict ⇒ refuse to start this net.
+
+**Client management (all inherited from `EvOmmConn`/`omm_server`).**
+Accept → login accept → publish the one-service directory (`OmmSourceDB`)
+→ serve dictionary/enumdefs streams from the loaded dict on request.
+Item request (`REQUEST_MSG_CLASS`) → `add_subj_stream()` → subject↔
+stream tables (`sub_tab` + `stream_ht`), `is_solicited` set on the
+requesting stream, and a `NotifySub` fires into the listener's
+sub_route.  Stream close → `NotifySub` del.  Delivery: `EvOmmConn::
+on_msg` accepts `RWF_MSG_TYPE_ID` publishes, copies per client, stamps
+the client's stream_id (offset 3+4), fragments oversized msgs, and
+delivers solicited REFRESHes only to streams whose `is_solicited` is
+pending (then clears it).
+
+**Interest surfacing.**  rvcache attaches a `RouteNotify` to the omm
+listener's sub_route: `on_sub` ⇒ `interest_set(subj, net_bit)` +
+upstream propagation, `on_unsub` ⇒ `interest_clear` — the same role the
+`_RV.INFO.SYSTEM.LISTEN` advisories play on sass2 nets and the sass3 SUB
+channel plays on `-S` nets.  submgr semantics unchanged; an OMM stream
+open is just a third interest source.  Non-streaming (snapshot)
+requests serve a refresh and close without registering interest — the
+OMM analogue of `_SNAP`.
+
+**Initial serve (cache hit).**  Solicited REFRESH built from the cached
+image: strip the sass header fields (MSG_TYPE / REC_TYPE / SEQ_NO /
+REC_STATUS — the `skip_hdr` convention `convert_msg` already honors),
+`RwfFieldListWriter::convert_msg(fields, true)` for the payload, wrap
+in an `RwfMsgWriter` envelope: REFRESH_MSG_CLASS, MARKET_PRICE domain,
+RWF_REFRESH_SOLICITED | REFRESH_COMPLETE, `seq_num` from the entry's
+seqno, state OPEN/OK.  Publish once with `RWF_MSG_TYPE_ID`; solicited
+gating + stream stamping do per-client delivery.  (For omm-fed subjects
+the cached element is already a field list — conversion degenerates to
+envelope wrap.)
+
+**Miss path.**  Interest registers upstream as usual;
+`pending_initial_secs` bounds the wait.  Mapping when it resolves
+negatively: sass TRANSIENT/NOT_FOUND ⇒ STATUS, state **CLOSED_RECOVER**
+(suspect — "may exist later", the honest translation of TRANSIENT);
+instrument death (DROP) ⇒ STATUS **CLOSED**.  Text carries the sass
+status string.
+
+**Update fan-out.**  A tick whose entry has this net's fwd bit set is
+converted ONCE: sass header → envelope (mapping below), remaining
+fields → `RwfFieldListWriter::convert_msg(update, skip_hdr)`, publish
+canonical envelope; `EvOmmConn` handles per-client stream ids.  This is
+the cross-codec path — bloom/forward-first unmolested forwarding cannot
+apply; cost is one unpack+rewrite per tick per omm sub net, gated by
+interest exactly like every other forward.
+
+**MSG_TYPE → msg_class (inverse of the feed-side mapping):**
+
+- INITIAL / VERIFY ⇒ unsolicited REFRESH (broadcast initial converges
+  listeners; VERIFY refreshes state without solicitation)
+- SNAPSHOT ⇒ solicited REFRESH (only ever produced answering a request)
+- UPDATE / CORRECT ⇒ UPDATE (update_type from REC_TYPE when meaningful)
+- CLOSING ⇒ final UPDATE, then STATUS CLOSED on the DROP that follows
+- TRANSIENT ⇒ STATUS (state per miss-path mapping above)
+- SEQ_NO ⇒ `seq_num`; REC_STATUS ⇒ state text
+
+**Service health.**  The directory's service state tracks the upstream
+feeds: all feed nets down ⇒ service suspect (directory update to
+clients); recovered ⇒ up.  `OmmSourceDB::add_source_listener` is the
+hook (`server.cpp` PrintSrcs shows the pattern).
+
+**Reuse map.**  `EvOmmConn` (sub.cpp): stream tables, solicited gating,
+stream_id rewrite, fragmentation — as-is.  `rv_submgr.cpp`: the
+templated `append_hdr<Writer>` + `convert_to_msg` machinery is the
+proof-of-shape for the converter (it does RWF→RV; this net needs the
+mirror RV→RWF, same writer dispatch).  New code: the RouteNotify glue,
+the sass→RWF converter, service-health wiring, and net-role plumbing in
+config.
+
 ## Open questions — resolved
 
 1. **Forward lookup without entry creation** *(re-resolved — submgr owns

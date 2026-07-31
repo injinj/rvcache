@@ -124,13 +124,45 @@ scoped by the per-net wildcard.)*
       `RwfMsgPeek::get_msg_class()` (REFRESH⇒initial, UPDATE⇒merge,
       STATUS⇒transient); serve = build solicited REFRESH envelope
       around the cached field list (per-requester stream_id).
+- [ ] **Milestone 4 feed side** (SPEC §"Milestone 4 design — OMM
+      protocol endpoint", 2026-07-31): `-<idx> feed omm <host:port>
+      <service>` net over `EvOmmClient` with an `OmmClientCB` (rvcache
+      owns subscribe/unsubscribe; no RouteNotify self-attach).  Ready =
+      on_connect after directory+dictionary; interest replay at ready,
+      batched on reconnect.  submgr refcnt edges → subscribe/
+      unsubscribe; `_SNAP` w/o interest → `send_snapshot()`.  Envelope
+      class → tick-path decision; multi-part REFRESH until
+      REFRESH_COMPLETE; STATUS CLOSED⇒evict, stale⇒forward status keep
+      image.  Dict: `-p` ⇒ no_dictionary, else wire download; neither ⇒
+      refuse to start.  Config keys: user, app_id, app_name,
+      instance_id, token.  omm-fed subjects default route_after_merge
+      (cross-codec fwd to RV nets).
+- [ ] **Milestone 4 client side** (SPEC §"Client side: EvOmmListen net",
+      2026-07-31, full spec): `-<idx> sub omm <listen> <service>` —
+      EvOmmConn inherits stream tables / solicited gating / stream_id
+      rewrite / fragmentation; rvcache adds (1) RouteNotify glue on the
+      listener's sub_route (on_sub⇒interest_set, on_unsub⇒clear;
+      snapshot requests serve-and-close, no interest), (2) the sass→RWF
+      converter (strip sass hdr, RwfFieldListWriter::convert_msg
+      skip_hdr, RwfMsgWriter envelope; convert ONCE, per-client stream
+      stamping is EvOmmConn's job), (3) service-health wiring
+      (feeds down ⇒ directory suspect; OmmSourceDB listener), (4) config
+      plumbing.  MSG_TYPE→msg_class map + miss mapping (TRANSIENT⇒
+      STATUS CLOSED_RECOVER, DROP⇒CLOSED) in the SPEC.  Dict required
+      (fname→fid) — refuse to start the net without it.
 - [ ] hand CacheTab the loaded `MDMsgDict` — `build_merge`/unpack
       currently pass NULL dict; RWF field-list iteration needs it (this
       is what the "-p loaded but unused" item was waiting for).
 - [ ] the snapshot-drain invariant: snapshot serve applies the subject's
       pending deltas before reading the image — REQUIRED once
       forward-precedes-merge lands; loud comment at the serve site.
-- [ ] (raims-side, tracked here for context) `_INBOX` reply path pinning
-      via an `EvPublish` path hint computed from the subject hash —
-      fixes the separate-tport initial-vs-update skew seen on gru's
-      4-wide mesh; precedent: control class pinned to path 0.
+- [x] (raims-side, done 2026-07-28) `_INBOX` reply path pinning:
+      `EvPublish.path_hint` (raikv) set in sassrv `ev_rv.cpp` —
+      listen-start delivery records `crc(bare subject)` in a ring slot
+      keyed by the reply inbox's trailing id (`update_reply_hint`,
+      `&sub[29]` strips the LISTEN.START prefix); inbox publishes stamp
+      the hint; raims `session.cpp` routes inbox with
+      `hash_to_path(path_hint ?: subj_hash)`, primary fallback.  The
+      initial rides the subject stream's path — the gru 4-wide skew is
+      fixed by construction.  Verify with rv_client `initial_late` /
+      `update_before` counters under replay load.
