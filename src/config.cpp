@@ -35,6 +35,9 @@ parse_role_proto( NetDef &nd,  const char *role,  const char *proto ) noexcept
   else if ( ::strcmp( proto, "sass3" ) == 0 ) {
     nd.s2 = false; nd.s3 = true;
   }
+  else if ( ::strcmp( proto, "omm" ) == 0 ) {
+    nd.s2 = false; nd.s3 = false; nd.omm = true;
+  }
   else
     return false;
   return true;
@@ -226,6 +229,17 @@ load_config( const char *path,  Config &cfg ) noexcept
     cfg.sequence_policy = parse_seq( s );
   if ( (s = json_str( o, "accounting_file" )) != NULL )
     cfg.accounting_file = s;
+  if ( (s = json_str( o, "omm_user" )) != NULL )
+    cfg.omm_user = s;
+  if ( (s = json_str( o, "omm_app_id" )) != NULL )
+    cfg.omm_app_id = s;
+  if ( (s = json_str( o, "omm_app_name" )) != NULL )
+    cfg.omm_app_name = s;
+  if ( (s = json_str( o, "omm_instance_id" )) != NULL )
+    cfg.omm_instance_id = s;
+  if ( (s = json_str( o, "omm_token" )) != NULL )
+    cfg.omm_token = s;
+  json_uint( o, "omm_service_id", cfg.omm_service_id );
   if ( (s = json_str( o, "map_name" ))  != NULL )
     cfg.map_name = s;
   if ( (s = json_str( o, "dict_path" )) != NULL )

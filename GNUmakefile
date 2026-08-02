@@ -115,6 +115,7 @@ md_home     := $(call test_makefile,raimd)
 dec_home    := $(call test_makefile,libdecnumber)
 kv_home     := $(call test_makefile,raikv)
 sassrv_home := $(call test_makefile,sassrv)
+omm_home    := $(call test_makefile,omm)
 
 ifeq (,$(dec_home))
 dec_home    := $(call test_makefile,$(md_home)/libdecnumber)
@@ -124,6 +125,21 @@ lnk_lib     := -Wl,--push-state -Wl,-Bstatic
 dlnk_lib    :=
 lnk_dep     :=
 dlnk_dep    :=
+
+# omm first: it depends on sassrv/raimd/raikv below
+ifneq (,$(omm_home))
+omm_lib     := $(omm_home)/$(libd)/libomm.a
+omm_dll     := $(omm_home)/$(libd)/libomm.$(dll)
+lnk_lib     += $(omm_lib)
+lnk_dep     += $(omm_lib)
+dlnk_lib    += -L$(omm_home)/$(libd) -lomm
+dlnk_dep    += $(omm_dll)
+rpath5       = ,-rpath,$(pwd)/$(omm_home)/$(libd)
+includes    += -I$(omm_home)/include
+else
+lnk_lib     += -lomm
+dlnk_lib    += -lomm
+endif
 
 ifneq (,$(sassrv_home))
 sassrv_lib  := $(sassrv_home)/$(libd)/libsassrv.a

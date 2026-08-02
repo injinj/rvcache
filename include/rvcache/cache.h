@@ -38,8 +38,14 @@ struct NetDef {
   bool     is_feed,  /* feed | sub */
            s2,       /* sass2: feed = _TIC broadcast consumer;
                       *        sub  = _RV.INFO advisories + _SNAP */
-           s3;       /* sass3: feed = _SASS.<feed>.PUB envelope consumer;
+           s3,       /* sass3: feed = _SASS.<feed>.PUB envelope consumer;
                       *        sub  = _SASS.<feed>.SUB wildcard interest */
+           omm;      /* omm:   feed = EvOmmClient consumer (daemon =
+                      *        provider host[:port], service = OMM
+                      *        service name, interactive interest);
+                      *        sub  = EvOmmListen provider (daemon =
+                      *        listen [host:]port, service = announced
+                      *        service name) */
   NetParm  parm;
   const char * wildcard; /* per-net subject filter:
                           * sub  = submgr filter, both sass2 and sass3
@@ -47,7 +53,7 @@ struct NetDef {
                           * feed = subscribe _TIC.<wild>.> (sass2) or
                           *        _SASS.<wild>.PUB (sass3) */
   NetDef() : idx( 0 ), is_feed( false ), s2( false ), s3( false ),
-             wildcard( 0 ) {}
+             omm( false ), wildcard( 0 ) {}
 };
 
 struct Config {
@@ -58,6 +64,13 @@ struct Config {
              * dict_path;            /* -p  */
   uint32_t     message_eviction_secs,/* -x  (0 == never) */
                pending_initial_secs; /* -P  (default 10) */
+  /* omm login attributes (config-file keys; apply to all omm nets) */
+  const char * omm_user,
+             * omm_app_id,
+             * omm_app_name,
+             * omm_instance_id,
+             * omm_token;
+  uint32_t     omm_service_id;       /* provider-side directory id (1) */
   SeqPolicy    sequence_policy;      /* -Q  */
   bool         replace_typeless_msgs, /* -r  replace (not merge) typeless */
                route_after_merge,    /* -M  */
@@ -66,6 +79,8 @@ struct Config {
 
   Config() : map_name( 0 ), accounting_file( 0 ), dict_path( 0 ),
              message_eviction_secs( 0 ), pending_initial_secs( 10 ),
+             omm_user( 0 ), omm_app_id( 0 ), omm_app_name( 0 ),
+             omm_instance_id( 0 ), omm_token( 0 ), omm_service_id( 1 ),
              sequence_policy( SEQ_OBSERVE ), replace_typeless_msgs( false ),
              route_after_merge( false ), quiet( false ), verbose( false ) {}
 

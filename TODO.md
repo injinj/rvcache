@@ -124,19 +124,44 @@ scoped by the per-net wildcard.)*
       `RwfMsgPeek::get_msg_class()` (REFRESH⇒initial, UPDATE⇒merge,
       STATUS⇒transient); serve = build solicited REFRESH envelope
       around the cached field list (per-requester stream_id).
-- [ ] **Milestone 4 feed side** (SPEC §"Milestone 4 design — OMM
-      protocol endpoint", 2026-07-31): `-<idx> feed omm <host:port>
-      <service>` net over `EvOmmClient` with an `OmmClientCB` (rvcache
-      owns subscribe/unsubscribe; no RouteNotify self-attach).  Ready =
-      on_connect after directory+dictionary; interest replay at ready,
-      batched on reconnect.  submgr refcnt edges → subscribe/
-      unsubscribe; `_SNAP` w/o interest → `send_snapshot()`.  Envelope
-      class → tick-path decision; multi-part REFRESH until
-      REFRESH_COMPLETE; STATUS CLOSED⇒evict, stale⇒forward status keep
-      image.  Dict: `-p` ⇒ no_dictionary, else wire download; neither ⇒
-      refuse to start.  Config keys: user, app_id, app_name,
-      instance_id, token.  omm-fed subjects default route_after_merge
-      (cross-codec fwd to RV nets).
+- [x] **Milestone 4 feed side** (implemented 2026-08-02, test/omm.sh B):
+      `-<idx> feed omm <host[:port]> [net] <service>` over `EvOmmClient`
+      + `OmmClientCB` (rvcache owns subscribe/unsubscribe).  Ready =
+      on_connect after directory+dictionary; interest replays at ready
+      (`omm_feed_ready`).  submgr refcnt edges → total-fwd_mask 0<->
+      nonzero transitions (`interest_edge_set/clear`) → upstream
+      subscribe/unsubscribe.  Envelope class → `handle_tic` type
+      override (REFRESH⇒INITIAL, STATUS closed⇒DROP / open⇒TRANSIENT +
+      rwf_code_to_sass_rec_status, else rwf_to_sass_msg_type).
+      **Deviation from spec:** RWF→sass RVMSG conversion at INGEST
+      (RvMsgWriter + convert_msg(fields, skip_hdr)) reusing the whole
+      existing tick path — field-list-native caching (type byte 0xca)
+      remains the later optimization for omm-fed→omm-served.  Login
+      attrs default (user "rv_cache") — NULL user = strlen crash in the
+      login msg-key writer.  `no_dictionary` always set (local dict
+      mandatory).  Feed loss = fail-fast like the rv nets (reconnect +
+      batched replay deferred).  `send_snapshot()` for _SNAP-w/o-
+      interest deferred (misses NOT_FOUND as before).
+- [x] **Milestone 4 client side** (implemented 2026-08-02, test/omm.sh
+      A): `-<idx> sub omm <[host:]port> [net] <service>` over
+      `EvOmmListen`; service announced via the directory-map path
+      (`announce_cache_service`: RwfMapWriter INFO+STATE filter lists →
+      `update_source_map` — add_source() alone builds no sector
+      routes).  `OmmSubNotify` (RouteNotify, src_type 'O' filter) →
+      on_omm_sub/unsub → interest edges + solicited initial from cache
+      (`omm_forward`) or STATUS suspect/open miss (`omm_send_status`;
+      **deviation:** open+suspect instead of CLOSED_RECOVER — stream
+      stays live, a later INITIAL refreshes, mirroring rv5 semantics).
+      Update fan-out in handle_tic: one canonical RWF envelope per tick
+      (`omm_forward`), EvOmmConn stamps per-client stream ids.
+      Unmappable fields (no fid) are dropped by convert_msg.  Service
+      health directory updates on feed loss: TODO.
+- [ ] Milestone 4 leftovers: reconnect + batched interest replay on the
+      omm feed (currently fail-fast); `send_snapshot()` for _SNAP
+      without interest + pending-inbox replies (InboxReplyTab pattern);
+      service-health directory updates (OmmSourceDB listener); field-
+      list-native caching for omm-fed subjects; multi-part REFRESH
+      accumulation (currently each part replaces).
 - [ ] **Milestone 4 client side** (SPEC §"Client side: EvOmmListen net",
       2026-07-31, full spec): `-<idx> sub omm <listen> <service>` —
       EvOmmConn inherits stream tables / solicited gating / stream_id
