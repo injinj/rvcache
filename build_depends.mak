@@ -2,3 +2,4 @@ sassrv_dep := 1.44
 raikv_dep := 1.42
 raimd_dep := 1.32
 libdecnumber_dep := 3.62
+omm_dep := 1.16
