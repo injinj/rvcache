@@ -39,6 +39,7 @@ rpmbuild/SOURCES/$(name_ver).tar.gz:
 	    -e "s/_raimd_dep/>= $(raimd_dep)/" \
 	    -e "s/_sassrv_dep/>= $(sassrv_dep)/" \
 	    -e "s/_libdecnumber_dep/>= $(libdecnumber_dep)/" \
+	    -e "s/_omm_dep/>= $(omm_dep)/" \
 	    -e "s/Sat Jan 01 2000/$(date)/" < rpm/$(name).spec > rpmbuild/SPECS/$(name).spec
 	mkdir -p $(rpm_src_dir)
 	for i in $(srctree) ; do ln -sf ../../../$$i $(rpm_src_dir) ; done
