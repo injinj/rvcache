@@ -6,6 +6,7 @@
 #include <sassrv/ev_rv_client.h>
 #include <sassrv/submgr.h>
 #include <raimd/md_msg.h>
+#include <raimd/dict_load.h>
 #include <raikv/route_ht.h>
 #include <raikv/array_space.h>
 #include <raikv/shm_ht.h>
@@ -171,6 +172,7 @@ struct CacheEntry {
 /* subject cache table.  Merge policy lives in cache_tab.cpp. */
 struct CacheTab {
   rai::kv::RouteVec< CacheEntry > tab;
+  rai::md::MDMsgDict       & dict;
   uint32_t                   next_id;
   char                     * scratch,     /* merge/build scratch buffer */
                            * scratch2;    /* MSG_TYPE normalize output */
@@ -195,9 +197,10 @@ struct CacheTab {
   size_t                     keybuf_len,
                              imgbuf_len;
 
-  CacheTab() : next_id( 1 ), scratch( 0 ), scratch2( 0 ), scratch_len( 0 ),
-               scratch2_len( 0 ), image_bytes( 0 ), map( 0 ), kctx( 0 ),
-               keybuf( 0 ), imgbuf( 0 ), keybuf_len( 0 ), imgbuf_len( 0 ) {}
+  CacheTab( rai::md::MDMsgDict &d ) : dict( d ), next_id( 1 ),
+    scratch( 0 ), scratch2( 0 ), scratch_len( 0 ), scratch2_len( 0 ),
+    image_bytes( 0 ), map( 0 ), kctx( 0 ),
+    keybuf( 0 ), imgbuf( 0 ), keybuf_len( 0 ), imgbuf_len( 0 ) {}
 
   /* attach the shm image store; no-op when shm.map == NULL (no -m) */
   void init_shm( rai::kv::EvShm &shm ) noexcept;

@@ -65,7 +65,8 @@ CacheTab::normalize_msg_type( const void *&bytes,  size_t &len,
                               uint32_t &enc ) noexcept
 {
   MDMsgMem mem;
-  MDMsg  * m = MDMsg::unpack( (void *) bytes, 0, len, enc, NULL, mem );
+  MDMsg  * m = MDMsg::unpack( (void *) bytes, 0, len, enc, this->dict.dict,
+                              mem );
   if ( m == NULL )
     return false;
   MDFieldIter * it = NULL;
@@ -353,8 +354,9 @@ CacheTab::build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
 {
   MDMsgMem mem;
   MDMsg * oldm = MDMsg::unpack( (void *) oldb, 0, old_len, old_enc,
-                                NULL, mem );
-  MDMsg * newm = MDMsg::unpack( (void *) upd, 0, upd_len, upd_enc, NULL, mem );
+                                this->dict.dict, mem );
+  MDMsg * newm = MDMsg::unpack( (void *) upd, 0, upd_len, upd_enc,
+                                this->dict.dict, mem );
   if ( oldm == NULL || newm == NULL )
     return 0;
   MDFieldIter * oit = NULL,

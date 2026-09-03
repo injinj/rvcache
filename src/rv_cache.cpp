@@ -12,6 +12,7 @@
 #include <raimd/md_msg.h>
 #include <raimd/md_dict.h>
 #include <raimd/rv_msg.h>
+#include <raimd/tib_msg.h>
 #include <raimd/sass.h>
 #include <raimd/md_field_iter.h>
 #include <raimd/dict_load.h>
@@ -31,7 +32,6 @@ using namespace rvcache;
 struct RvCache {
   EvPoll         & poll;
   EvShm          & shm;
-  MDMsgDict      & dict;
   Config         & cfg;
   CacheTab         cache;
   Stats            stats,
@@ -52,7 +52,7 @@ struct RvCache {
   char               pubbuf[ 64 * 1024 ];
 
   RvCache( EvPoll &p,  EvShm &s,  MDMsgDict &d,  Config &c )
-    : poll( p ), shm( s ), dict( d ), cfg( c ), sub_nets( 0 ),
+    : poll( p ), shm( s ), cfg( c ), cache( d ), sub_nets( 0 ),
       omm_feeds( 0 ), omm_subs( 0 ), omm_dict( 0 ), omm_listener( 0 ),
       acct( 0 ) {
     for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
@@ -85,6 +85,7 @@ struct RvCache {
   void on_snapshot( RvSubscriptionListener::Snap &snp,
                     uint32_t net ) noexcept;
   void on_sass3( RvSubscriptionListener::Sass3 &sa3,  uint32_t net ) noexcept;
+  void on_tic_reply( RvSubscriptionListener::Tic &tic,  uint32_t net ) noexcept;
   /* omm feed side: EvOmmClient consumer (RWF -> sass at ingest, then
    * the normal handle_tic path; SPEC Milestone 4 feed side) */
   bool on_omm_feed_msg( uint32_t net,  const char *subj,  size_t len,
@@ -213,7 +214,7 @@ RvCache::stamp_msg_type( void *bytes,  size_t len,  uint32_t enc,
     return false;
   MDMsgMem mem;
   MDMsg  * m = MDMsg::unpack( bytes, 0, len, enc,
-                              this->dict.dict, mem );
+                              this->cache.dict.dict, mem );
   if ( m == NULL )
     return false;
   MDFieldIter * it = NULL;
@@ -322,7 +323,7 @@ RvCache::on_sass3_feed_msg( EvPublish &pub ) noexcept
     return;
   MDMsgMem mem;
   MDMsg  * m = MDMsg::unpack( (void *) pub.msg, 0, pub.msg_len, pub.msg_enc,
-                              this->dict.dict, mem );
+                              this->cache.dict.dict, mem );
   if ( m == NULL )
     return;
   MDFieldReader rd( *m );
@@ -360,8 +361,8 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
   this->stats.bytes_recv += len + msg_len;
 
   MDMsgMem mem;
-  MDMsg *  m = MDMsg::unpack( (void *) msg, 0, msg_len, enc, this->dict.dict,
-                              mem );
+  MDMsg *  m = MDMsg::unpack( (void *) msg, 0, msg_len, enc,
+                              this->cache.dict.dict, mem );
   uint16_t msg_type = 0, rec_status = 0;
   uint32_t seqno = 0;
   bool     has_type = false, has_seqno = false, has_status = false;
@@ -587,7 +588,7 @@ RvCache::on_snapshot( RvSubscriptionListener::Snap &snp,
   /* submgr resolved the requester's session from the reply inbox; its
    * user_id attributes the request for accounting */
   this->serve_snapshot( net, snp.sub.value, snp.sub.len, snp.reply,
-                        snp.reply_len, &snp.session, snp.flags );
+                        snp.reply_len, snp.session, snp.flags );
 }
 
 void
@@ -722,6 +723,27 @@ RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3,
        ( sa3.flags & ( QF_SNAPSHOT | QF_INITIAL_VALUES | QF_REFRESH ) ) != 0 )
     this->serve_snapshot( net, subj, len, sa3.reply, sa3.reply_len, NULL,
                           sa3.flags, &sa3.sass3 );
+}
+
+void
+RvCache::on_tic_reply( RvSubscriptionListener::Tic &tic,
+                       uint32_t net ) noexcept
+{
+  static const char dd[] = "_TIC.REPLY.SASS.DATA.DICTIONARY";
+  const char * subj = tic.sub.value;
+  size_t       len  = tic.sub.len;
+
+  if ( len == sizeof( dd ) - 1 && ::memcmp( subj, dd, len ) == 0 ) {
+    if ( tic.reply_len > 0 && this->cache.dict.cfile_dict != NULL ) {
+      MDMsgMem mem;
+      size_t   sz  = 1024 * 1024;
+      void   * bp  = mem.make( sz );
+      TibMsgWriter w( mem, bp, sz );
+      CFile::pack_sass( this->cache.dict.cfile_dict, w );
+      this->publish_msg( net, tic.reply, tic.reply_len, NULL, 0, w.buf,
+                         w.off + w.hdrlen, TIBMSG_TYPE_ID );
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -945,7 +967,7 @@ RvCache::omm_forward( const char *subj,  size_t len,  const void *msg,
   }
   MDMsgMem mem;
   MDMsg * m = MDMsg::unpack( (void *) msg, 0, msg_len, enc,
-                             this->dict.dict, mem );
+                             this->cache.dict.dict, mem );
   if ( m == NULL )
     return;
   bool is_refresh = ( msg_type == MD_INITIAL_TYPE ||
@@ -1331,7 +1353,7 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
     bool all = ( this->wildcard == NULL );
     if ( this->wildcard != NULL ) /* per-net filter, sass2 and sass3 */
       this->sub_db.add_wildcard( this->wildcard );
-    this->sub_db.start_subscriptions( all, this->s2, this->s3 );
+    this->sub_db.start_subscriptions( all, this->s2, this->s3, true );
     this->poll.timer.add_timer_millis( *this, 1000, 1, 0 );
   }
   virtual void on_shutdown( EvSocket &conn,  const char *err,
@@ -1363,6 +1385,9 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
   }
   virtual void on_sass3( Sass3 &sa3 ) noexcept {
     this->cache.on_sass3( sa3, this->net );
+  }
+  virtual void on_tic_reply( Tic &tic ) noexcept {
+    this->cache.on_tic_reply( tic, this->net );
   }
 };
 

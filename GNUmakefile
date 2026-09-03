@@ -137,7 +137,7 @@ dlnk_dep    += $(omm_dll)
 rpath5       = ,-rpath,$(pwd)/$(omm_home)/$(libd)
 includes    += -I$(omm_home)/include
 else
-lnk_lib     += -lomm
+lnk_lib     += $(push_static) -lomm $(pop_static)
 dlnk_lib    += -lomm
 endif
 
@@ -151,7 +151,7 @@ dlnk_dep    += $(sassrv_dll)
 rpath4       = ,-rpath,$(pwd)/$(sassrv_home)/$(libd)
 includes    += -I$(sassrv_home)/include
 else
-lnk_lib     += -lsassrv
+lnk_lib     += $(push_static) -lsassrv $(pop_static)
 dlnk_lib    += -lsassrv
 endif
 
@@ -197,11 +197,11 @@ lnk_lib     += $(push_static) -lraikv $(pop_static)
 dlnk_lib    += -lraikv
 endif
 
-rpath   := -Wl,-rpath,$(pwd)/$(libd)$(rpath1)$(rpath2)$(rpath3)$(rpath4)
+rpath   := -Wl,-rpath,$(pwd)/$(libd)$(rpath1)$(rpath2)$(rpath3)$(rpath4)$(rpath5)
 lnk_lib += -Wl,--pop-state
 
 .PHONY: everything
-everything: $(kv_lib) $(dec_lib) $(md_lib) $(sassrv_lib) all
+everything: $(kv_lib) $(dec_lib) $(md_lib) $(sassrv_lib) $(omm_lib) all
 
 clean_subs :=
 # build submodules if have them
@@ -228,6 +228,22 @@ $(md_lib) $(md_dll):
 clean_md:
 	$(MAKE) -C $(md_home) clean
 clean_subs += clean_md
+endif
+ifneq (,$(sassrv_home))
+$(sassrv_lib) $(sassrv_dll):
+	$(MAKE) -C $(sassrv_home)
+.PHONY: clean_sassrv
+clean_sassrv:
+	$(MAKE) -C $(sassrv_home) clean
+clean_subs += clean_sassrv
+endif
+ifneq (,$(omm_home))
+$(omm_lib) $(omm_dll):
+	$(MAKE) -C $(omm_home)
+.PHONY: clean_omm
+clean_omm:
+	$(MAKE) -C $(omm_home) clean
+clean_subs += clean_omm
 endif
 
 # build depends for rpm spec file
