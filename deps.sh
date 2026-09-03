@@ -20,25 +20,32 @@
 set -e
 
 ORG="${ORG:-https://github.com/raitechnology}"
+# repos that live under a different org (master there kicks the COPR rel build)
+org_for() { case "$1" in linecook|rdbparser) echo "https://github.com/injinj" ;; *) echo "$ORG" ;; esac; }
+# repos whose buildable branch is not the github default (openpgm master is
+# upstream-pristine; the GNUmakefile port lives on 'rai')
+branch_for() { case "$1" in openpgm) echo rai ;; *) echo "" ;; esac; }
+# build_depends.mak names rpm packages; map the ones whose repo is named differently
+repo_for() { case "$1" in h3lib) echo h3 ;; hdrhist) echo HdrHistogram_c ;; openpgm_st) echo openpgm ;; *) echo "$1" ;; esac; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PARENT="$(dirname "$HERE")"
 DEPFILE="$HERE/build_depends.mak"
 
 # global topological order (leaves first); filtered by what DEPFILE names
-TOPO="libdecnumber raikv raimd h3 linecook rdbparser hdrhist openpgm
+TOPO="libdecnumber raikv raimd h3 linecook rdbparser HdrHistogram_c openpgm
       sassrv natsmd raids omm raims"
 
 build=0; dry=0
 while getopts "bnh" o; do case "$o" in
-  b) build=*** ;;
-  n) dry=*** ;;
+  b) build=1 ;;
+  n) dry=1 ;;
   *) sed -n '2,20p' "$0"; exit 0 ;;
 esac; done
 
 [ -f "$DEPFILE" ] || { echo "missing $DEPFILE" >&2; exit 1; }
 
 # "raikv_dep := 1.42" -> "raikv"
-deps="$(sed -n 's/^\([a-z0-9_]*\)_dep[[:space:]]*:=.*/\1/p' "$DEPFILE")"
+deps="$(sed -n 's/^\([A-Za-z0-9_]*\)_dep[[:space:]]*:=.*/\1/p' "$DEPFILE" | while read -r d; do repo_for "$d"; done)"
 [ -n "$deps" ] || { echo "no *_dep entries in $DEPFILE" >&2; exit 1; }
 
 want() { echo "$deps" | grep -qx "$1"; }
@@ -56,8 +63,9 @@ echo "deps (build order):$ordered"
 
 for r in $ordered; do
   if [ ! -d "$PARENT/$r/.git" ]; then
-    echo "clone: $ORG/$r -> $PARENT/$r"
-    [ "$dry" = 1 ] || git clone "$ORG/$r" "$PARENT/$r"
+    br="$(branch_for "$r")"
+    echo "clone: $(org_for "$r")/$r${br:+ @$br} -> $PARENT/$r"
+    [ "$dry" = 1 ] || git clone ${br:+-b "$br"} "$(org_for "$r")/$r" "$PARENT/$r"
   else
     echo "have:  $PARENT/$r"
   fi
