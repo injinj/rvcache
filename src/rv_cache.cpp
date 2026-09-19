@@ -14,6 +14,7 @@
 #endif
 #include <new>
 #include <rvcache/cache.h>
+#include <rvcache/rv_cache.h>
 #include <raimd/md_msg.h>
 #include <raimd/md_dict.h>
 #include <raimd/rv_msg.h>
@@ -32,146 +33,6 @@ using namespace md;
 using namespace sassrv;
 using namespace omm;
 using namespace rvcache;
-
-/* ------------------------------------------------------------------ */
-struct RvCache {
-  EvPoll         & poll;
-  EvShm          & shm;
-  Config         & cfg;
-  CacheTab         cache;
-  Stats            stats,
-                   old;
-  /* network attachments by mask bit (idx - 1); feeds have conns only */
-  EvRvClient       * sub_conns[ MAX_NETS ];
-  RvSubscriptionDB * sub_dbs[ MAX_NETS ];
-  uint64_t           sub_nets;  /* mask of configured sub nets */
-  /* omm nets (SPEC Milestone 4): feed side = EvOmmClient consumers,
-   * provider side = EvOmmListen serving OMM clients from the cache */
-  EvOmmClient      * omm_conns[ MAX_NETS ]; /* omm feed clients */
-  const char       * omm_wild[ MAX_NETS ];  /* omm feed wildcard filters */
-  uint64_t           omm_feeds,             /* mask: omm feed nets READY */
-                     omm_subs;              /* mask: omm provider nets */
-  OmmDict          * omm_dict;              /* rdm dict for omm nets */
-  EvOmmListen      * omm_listener;          /* provider listener */
-  FILE             * acct;
-  char               pubbuf[ 64 * 1024 ];
-
-  RvCache( EvPoll &p,  EvShm &s,  MDMsgDict &d,  Config &c )
-    : poll( p ), shm( s ), cfg( c ), cache( d ), sub_nets( 0 ),
-      omm_feeds( 0 ), omm_subs( 0 ), omm_dict( 0 ), omm_listener( 0 ),
-      acct( 0 ) {
-    for ( uint32_t i = 0; i < MAX_NETS; i++ ) {
-      this->sub_conns[ i ] = NULL;
-      this->sub_dbs[ i ]   = NULL;
-      this->omm_conns[ i ] = NULL;
-      this->omm_wild[ i ]  = NULL;
-    }
-    this->stats.log_ns = poll.now_ns;
-    this->cache.init_shm( s ); /* -m map_name: images live in raikv shm */
-  }
-
-  uint32_t cur_mono( void ) const {
-    return (uint32_t) ( this->poll.mono_ns / (uint64_t) 1000000000 );
-  }
-  uint64_t now_ns( void ) const { return current_realtime_ns(); }
-
-  /* feed path (net 1) */
-  void on_feed_msg( EvPublish &pub ) noexcept;
-  void on_sass3_feed_msg( EvPublish &pub ) noexcept;
-  void handle_tic( const char *subj,  size_t len,  const void *msg,
-                   size_t msg_len,  uint32_t enc,
-                   bool has_type_ovr = false,
-                   uint16_t type_ovr = 0 ) noexcept;
-  /* interest (submgr callbacks; net = mask bit of the sub network) */
-  void on_listen_start( RvSubscriptionListener::Start &add,
-                        uint32_t net ) noexcept;
-  void on_listen_stop( RvSubscriptionListener::Stop &rem,
-                       uint32_t net ) noexcept;
-  void on_snapshot( RvSubscriptionListener::Snap &snp,
-                    uint32_t net ) noexcept;
-  void on_sass3( RvSubscriptionListener::Sass3 &sa3,  uint32_t net ) noexcept;
-  void on_tic_reply( RvSubscriptionListener::Tic &tic,  uint32_t net ) noexcept;
-  /* omm feed side: EvOmmClient consumer (RWF -> sass at ingest, then
-   * the normal handle_tic path; SPEC Milestone 4 feed side) */
-  bool on_omm_feed_msg( uint32_t net,  const char *subj,  size_t len,
-                        md::RwfMsg &m ) noexcept;
-  void omm_feed_ready( uint32_t net ) noexcept;
-  bool omm_wild_match( uint32_t net,  const char *subj,
-                       size_t len ) noexcept;
-  void omm_feed_subscribe( const char *subj,  size_t len ) noexcept;
-  void omm_feed_unsubscribe( const char *subj,  size_t len ) noexcept;
-  /* interest edge: total fwd_mask 0 <-> nonzero drives the upstream
-   * omm subscriptions (interactive-feed pattern) */
-  void interest_edge_set( const char *subj,  size_t len,
-                          uint32_t net ) noexcept;
-  void interest_edge_clear( const char *subj,  size_t len,
-                            uint32_t net ) noexcept;
-  /* omm provider side: EvOmmListen clients fed from the sass2/sass3
-   * tick flow (sass -> RWF once per tick; EvOmmConn stamps per-client
-   * stream ids; SPEC Milestone 4 client side) */
-  void on_omm_sub( kv::NotifySub &sub,  uint32_t net ) noexcept;
-  void on_omm_unsub( kv::NotifySub &sub,  uint32_t net ) noexcept;
-  void omm_forward( const char *subj,  size_t len,  const void *msg,
-                    size_t msg_len,  uint32_t enc,  uint16_t msg_type,
-                    uint32_t seqno,  bool solicited ) noexcept;
-  void omm_send_status( const char *subj,  size_t len,
-                        bool closed ) noexcept;
-  /* timers */
-  void on_timer( void ) noexcept;
-  void print_stats( bool final_totals ) noexcept;
-
-  /* helpers */
-  /* stamp MSG_TYPE (leading fixed-width int, normalized at store time)
-   * directly into the cached image via MDFieldIter::update() */
-  bool stamp_msg_type( void *bytes,  size_t len,  uint32_t enc,
-                       uint16_t msg_type ) noexcept;
-  /* serve-path lookup: in shm mode another rv_cache process may have
-   * cached the subject's image, so a missing local entry doesn't mean a
-   * miss -- mint the local metadata entry and let get_image consult the
-   * map.  Tick/accounting paths keep the plain find(). */
-  CacheEntry * find_for_image( const char *subj,  size_t len ) noexcept {
-    CacheEntry * e = this->cache.find( subj, len );
-    if ( e == NULL && this->cache.shm_mode() ) {
-      bool is_new;
-      e = this->cache.upsert( subj, len, is_new );
-    }
-    return e;
-  }
-  /* publish to one sub net (replies, per-net broadcasts) */
-  void publish_msg( uint32_t net,  const char *subj,  size_t len,
-                    const char *reply,  size_t reply_len,  const void *msg,
-                    size_t msg_len,  uint32_t enc ) noexcept;
-  /* publish to every sub net whose fwd_mask bit is set (tick forwards) */
-  void publish_mask( uint64_t mask,  const char *subj,  size_t len,
-                     const void *msg,  size_t msg_len,
-                     uint32_t enc ) noexcept;
-  size_t build_status( uint16_t msg_type,  uint16_t rec_status,
-                       const char *subj,  size_t len,  char *buf,
-                       size_t buflen ) noexcept;
-  void emit_nosubscribers( uint32_t net,  const char *subj,
-                           size_t len ) noexcept;
-  void serve_snapshot( uint32_t net,  const char *subj,  size_t len,
-                       const char *reply,  size_t reply_len,
-                       const RvSessionEntry *sess,  uint16_t flags,
-                       const RvSass3Entry *s3 = NULL ) noexcept;
-  /* miss: TRANSIENT / NOT_FOUND to the reply inbox (bcast-nack); the one
-   * code path shared by _SNAP, listen-start-inbox and sass3 requests */
-  void serve_miss( uint32_t net,  const char *subj,  size_t len,
-                   const char *reply,  size_t reply_len ) noexcept;
-  /* asserted interest (sass2 query discovery / sass3 resubscribe of an
-   * unknown holder): broadcast an initial on the subject -- listeners
-   * that predate rv_cache converge on the image; no inbox involved */
-  void broadcast_initial( uint32_t net,  const char *subj,  size_t len,
-                          const RvSessionEntry *sess,
-                          const RvSass3Entry *s3,
-                          const char *proto ) noexcept;
-  void acct_event( const char *event,  const char *subj,  size_t sublen,
-                   const RvSessionEntry *sess,  const char *proto,
-                   uint16_t query_flags,  const char *reason,
-                   double open_secs,  uint64_t msgs,
-                   uint64_t images,
-                   const RvSass3Entry *s3 = NULL ) noexcept;
-};
 
 /* parse SASS header fields out of a raimd message */
 static bool
@@ -314,49 +175,6 @@ RvCache::on_feed_msg( EvPublish &pub ) noexcept
   this->handle_tic( subj + 5, len - 5, pub.msg, pub.msg_len, pub.msg_enc );
 }
 
-/* sass3 feed path: _SASS.<feed>.PUB broadcast envelope (Sass3Svc::doFeed
- * shape):  { M : 23177, T : MSG_TYPE, D : { <subject> : <opaque msg>
- * [, <subject> : <opaque msg> ] } }.  T overrides the payload's MSG_TYPE
- * when present; S, I, A, G, E are ignored for now. */
-void
-RvCache::on_sass3_feed_msg( EvPublish &pub ) noexcept
-{
-  const char * subj = pub.subject;
-  size_t       len  = pub.subject_len;
-  if ( len <= 10 || ::memcmp( subj, "_SASS.", 6 ) != 0 ||
-       ::memcmp( &subj[ len - 4 ], ".PUB", 4 ) != 0 )
-    return;
-  MDMsgMem mem;
-  MDMsg  * m = MDMsg::unpack( (void *) pub.msg, 0, pub.msg_len, pub.msg_enc,
-                              this->cache.dict.dict, mem );
-  if ( m == NULL )
-    return;
-  MDFieldReader rd( *m );
-  uint16_t      magic = 0;
-  if ( ! rd.find( "M", 2 ) || ! rd.get_uint( magic ) ||
-       magic != SASS3_PUB_MAGIC )
-    return;
-  uint16_t type_ovr = 0;
-  bool     has_ovr  = false;
-  if ( rd.find( "T", 2 ) && rd.get_uint( type_ovr ) )
-    has_ovr = true;
-  MDMsg * d = NULL;
-  if ( ! rd.find( "D", 2 ) || ! rd.get_sub_msg( d ) || d == NULL )
-    return;
-  /* each D field: name = data subject, value = opaque message bytes */
-  MDFieldReader dr( *d );
-  MDName        n;
-  for ( bool b = dr.first( n ); b; b = dr.next( n ) ) {
-    void * data;
-    size_t dlen,
-           slen = n.fnamelen;
-    while ( slen > 0 && n.fname[ slen - 1 ] == '\0' )
-      slen--;
-    if ( slen > 0 && dr.get_opaque( data, dlen ) )
-      this->handle_tic( n.fname, slen, data, dlen, 0, has_ovr, type_ovr );
-  }
-}
-
 void
 RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
                      size_t msg_len,  uint32_t enc,
@@ -494,390 +312,6 @@ RvCache::handle_tic( const char *subj,  size_t len,  const void *msg,
 }
 
 /* ------------------------------------------------------------------ */
-void
-RvCache::on_listen_start( RvSubscriptionListener::Start &add,
-                          uint32_t net ) noexcept
-{
-  const char * subj = add.sub.value;
-  size_t       len  = add.sub.len;
-  /* default interest filter: ignore _-prefixed subjects (advisories, _SNAP,
-   * _TIC, and rv_cache's own subscriptions) -- they are never downstream
-   * consumer interest. */
-  if ( len == 0 || subj[ 0 ] == '_' )
-    return;
-  const char * proto = add.session.has_daemon ? "rv7" : "rv5";
-
-  /* subscribe with refcnt > 0: set this net's forwarding bit (and the
-   * total-interest edge drives the upstream omm subscription) */
-  if ( add.sub.refcnt > 0 )
-    this->interest_edge_set( subj, len, net );
-  /* submgr already ref'd the subscription; refcnt 1 == subject went live */
-  if ( add.sub.refcnt == 1 ) {
-    this->stats.subscription_starts++;
-    this->stats.subscriptions_active++;
-  }
-  this->acct_event( "subscribe", subj, len, &add.session, proto, 0,
-                    NULL, 0, 0, 0 );
-
-  /* interest asserted from a session/subscription query reply rather
-   * than a live advisory (no inbox on this path): rv_cache is
-   * (re)discovering listeners that predate it -- e.g. at startup.  If
-   * the subject just went live and an image exists, broadcast an
-   * initial so those listeners converge. */
-  if ( ! add.is_listen_start && add.sub.refcnt == 1 )
-    this->broadcast_initial( net, subj, len, &add.session, NULL, proto );
-
-  /* initial-on-listen (rv5 path): the CLIENT controls this -- attaching an
-   * inbox to the listen-start is the request for an initial.  No option. */
-  if ( add.reply_len > 0 ) {
-    CacheEntry * e = this->find_for_image( subj, len );
-    void   * img;
-    size_t   img_len;
-    uint32_t img_enc;
-    if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) ) {
-      this->stamp_msg_type( img, img_len, img_enc,
-                            (uint16_t) MD_INITIAL_TYPE );
-      this->publish_msg( net, add.reply, add.reply_len, NULL, 0, img,
-                         img_len, img_enc );
-      e->snap_count++;
-      this->acct_event( "initial", subj, len, &add.session, proto, 0,
-                        NULL, 0, 0, 0 );
-      this->stats.initials_sent++;
-    }
-    else {
-      /* miss -> status to the inbox, never silence (spec 2): the
-       * requester attached an inbox precisely to learn the subject's
-       * state.  Interest stays registered; a later INITIAL broadcasts. */
-      this->serve_miss( net, subj, len, add.reply, add.reply_len );
-      this->stats.initials_not_found++;
-    }
-  }
-}
-
-void
-RvCache::on_listen_stop( RvSubscriptionListener::Stop &rem,
-                         uint32_t net ) noexcept
-{
-  const char * subj = rem.sub.value;
-  size_t       len  = rem.sub.len;
-  if ( len == 0 || subj[ 0 ] == '_' )
-    return;
-  if ( rem.is_orphan ) /* stop without start: nothing was subscribed */
-    return;
-  const char * proto  = rem.session.has_daemon ? "rv7" : "rv5";
-  /* advisory stop vs session/host sweep (submgr timeout machinery) */
-  const char * reason = rem.is_listen_stop ? "listen_stop" : "host_stop";
-  uint32_t     now    = this->cur_mono();
-  double open_secs = ( now >= rem.sub.start_mono ) ?
-                     (double) ( now - rem.sub.start_mono ) : 0.0;
-  CacheEntry * e = this->cache.find( subj, len );
-  this->acct_event( "unsubscribe", subj, len, &rem.session, proto, 0,
-                    reason, open_secs,
-                    e != NULL ? e->forward_count : 0,
-                    e != NULL ? e->snap_count : 0 );
-
-  /* submgr already deref'd; refcnt 0 == last holder gone on this net:
-   * clear the forwarding bit */
-  if ( rem.sub.refcnt == 0 ) {
-    this->interest_edge_clear( subj, len, net );
-    this->stats.subscription_stops++;
-    this->stats.subscriptions_active--;
-    this->emit_nosubscribers( net, subj, len );
-  }
-}
-
-void
-RvCache::on_snapshot( RvSubscriptionListener::Snap &snp,
-                      uint32_t net ) noexcept
-{
-  /* submgr resolved the requester's session from the reply inbox; its
-   * user_id attributes the request for accounting */
-  this->serve_snapshot( net, snp.sub.value, snp.sub.len, snp.reply,
-                        snp.reply_len, snp.session, snp.flags );
-}
-
-void
-RvCache::serve_snapshot( uint32_t net,  const char *subj,  size_t len,
-                         const char *reply,  size_t reply_len,
-                         const RvSessionEntry *sess,  uint16_t flags,
-                         const RvSass3Entry *s3 ) noexcept
-{
-  if ( reply == NULL || reply_len == 0 )
-    return;
-  CacheEntry * e = this->find_for_image( subj, len );
-  void   * img;
-  size_t   img_len;
-  uint32_t img_enc;
-  if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) ) {
-    /* stamp for the delivery kind: INITIAL when the requester is
-     * subscribing (INITIAL_VALUES), SNAPSHOT for a plain image poll */
-    bool         is_initial = ( flags & QF_INITIAL_VALUES ) != 0;
-    const char * event      = is_initial ? "initial" : "snapshot";
-    this->stamp_msg_type( img, img_len, img_enc, (uint16_t)
-                          ( is_initial ? MD_INITIAL_TYPE : MD_SNAPSHOT_TYPE ) );
-    this->publish_msg( net, reply, reply_len, NULL, 0, img,
-                       img_len, img_enc );
-    e->snap_count++;
-    this->stats.snaps_sent++;
-    this->acct_event( event, subj, len, sess,
-                      s3 != NULL ? "sass3" : "snap", flags,
-                      NULL, 0, 0, 0, s3 );
-  }
-  else {
-    /* broadcast-feed miss: TRANSIENT / NOT_FOUND immediately (bcast-nack) */
-    this->serve_miss( net, subj, len, reply, reply_len );
-    this->stats.snaps_not_found++;
-  }
-}
-
-void
-RvCache::serve_miss( uint32_t net,  const char *subj,  size_t len,
-                     const char *reply,  size_t reply_len ) noexcept
-{
-  char buf[ 1024 ];
-  size_t n = this->build_status( (uint16_t) MD_TRANSIENT_TYPE,
-                                 (uint16_t) MD_NOT_FOUND_STATUS,
-                                 subj, len, buf, sizeof( buf ) );
-  this->publish_msg( net, reply, reply_len, NULL, 0, buf, n, RVMSG_TYPE_ID );
-}
-
-void
-RvCache::broadcast_initial( uint32_t net,  const char *subj,  size_t len,
-                            const RvSessionEntry *sess,
-                            const RvSass3Entry *s3,
-                            const char *proto ) noexcept
-{
-  CacheEntry * e = this->find_for_image( subj, len );
-  void   * img;
-  size_t   img_len;
-  uint32_t img_enc;
-  if ( e == NULL || ! this->cache.get_image( *e, img, img_len, img_enc ) )
-    return; /* cold: the feed's next INITIAL broadcasts normally */
-  this->stamp_msg_type( img, img_len, img_enc, (uint16_t) MD_INITIAL_TYPE );
-  this->publish_msg( net, subj, len, NULL, 0, img, img_len, img_enc );
-  e->snap_count++;
-  this->acct_event( "initial", subj, len, sess, proto, 0,
-                    NULL, 0, 0, 0, s3 );
-}
-
-/* sass3 interest on net 2 (submgr wildcard _SASS.<feed>.SUB channel).
- * submgr owns the holder's life: it refs the subscription on a new
- * holder, derefs on UNSUBSCRIBE and on lease expiry (480s), and fires
- * this callback for each subject in the S submessage. */
-void
-RvCache::on_sass3( RvSubscriptionListener::Sass3 &sa3,
-                   uint32_t net ) noexcept
-{
-  const char * subj = sa3.sub.value;
-  size_t       len  = sa3.sub.len;
-  if ( len == 0 || subj[ 0 ] == '_' )
-    return;
-
-  if ( ( sa3.flags & QF_UNSUBSCRIBE ) != 0 ) {
-    if ( sa3.is_orphan ) /* unsubscribe without subscribe */
-      return;
-    /* is_asserted on an UNSUBSCRIBE == submgr lease expiry sweep */
-    const char * reason = sa3.is_asserted ? "hold_timer" : "unsubscribe";
-    uint32_t     now    = this->cur_mono();
-    double open_secs = ( sa3.sass3.start_mono != 0 &&
-                         now >= sa3.sass3.start_mono ) ?
-                       (double) ( now - sa3.sass3.start_mono ) : 0.0;
-    CacheEntry * e = this->cache.find( subj, len );
-    this->acct_event( "unsubscribe", subj, len, NULL, "sass3", sa3.flags,
-                      reason, open_secs,
-                      e != NULL ? e->forward_count : 0,
-                      e != NULL ? e->snap_count : 0, &sa3.sass3 );
-    /* submgr already deref'd; refcnt 0 == last holder gone on this net:
-     * clear the forwarding bit */
-    if ( sa3.sub.refcnt == 0 ) {
-      this->interest_edge_clear( subj, len, net );
-      this->stats.subscription_stops++;
-      this->stats.subscriptions_active--;
-      this->emit_nosubscribers( net, subj, len );
-    }
-    return;
-  }
-
-  /* SUBSCRIBE (or a RESUBSCRIBE asserting a holder submgr didn't know):
-   * submgr already ref'd; refcnt 1 == subject went live */
-  if ( ( sa3.flags & QF_SUBSCRIBE ) != 0 || sa3.is_asserted ) {
-    if ( sa3.sub.refcnt > 0 )
-      this->interest_edge_set( subj, len, net );
-    if ( sa3.sub.refcnt == 1 ) {
-      this->stats.subscription_starts++;
-      this->stats.subscriptions_active++;
-    }
-    this->acct_event( "subscribe", subj, len, NULL, "sass3", sa3.flags,
-                      NULL, 0, 0, 0, &sa3.sass3 );
-  }
-
-  if ( sa3.is_asserted ) {
-    /* RESUBSCRIBE renewing a holder submgr didn't know: interest that
-     * predates rv_cache (startup rediscovery).  The holder already
-     * believes it is subscribed -- broadcast an initial on the subject
-     * so it (and every other listener) converges on the image.  The
-     * REFRESH bit here was OR'd in by submgr, not asked by the client,
-     * so nothing goes to the inbox. */
-    if ( sa3.sub.refcnt == 1 )
-      this->broadcast_initial( net, subj, len, NULL, &sa3.sass3, "sass3" );
-  }
-  /* image request to the inbox: SNAPSHOT (poll), INITIAL_VALUES
-   * (subscribe-image) or REFRESH (ask for another image); miss ->
-   * TRANSIENT/NOT_FOUND, same one-code-path as _SNAP */
-  else if ( sa3.reply_len > 0 &&
-       ( sa3.flags & ( QF_SNAPSHOT | QF_INITIAL_VALUES | QF_REFRESH ) ) != 0 )
-    this->serve_snapshot( net, subj, len, sa3.reply, sa3.reply_len, NULL,
-                          sa3.flags, &sa3.sass3 );
-}
-
-void
-RvCache::on_tic_reply( RvSubscriptionListener::Tic &tic,
-                       uint32_t net ) noexcept
-{
-  static const char dd[] = "_TIC.REPLY.SASS.DATA.DICTIONARY";
-  const char * subj = tic.sub.value;
-  size_t       len  = tic.sub.len;
-
-  if ( len == sizeof( dd ) - 1 && ::memcmp( subj, dd, len ) == 0 ) {
-    if ( tic.reply_len > 0 && this->cache.dict.cfile_dict != NULL ) {
-      MDMsgMem mem;
-      size_t   sz  = 1024 * 1024;
-      void   * bp  = mem.make( sz );
-      TibMsgWriter w( mem, bp, sz );
-      CFile::pack_sass( this->cache.dict.cfile_dict, w );
-      this->publish_msg( net, tic.reply, tic.reply_len, NULL, 0, w.buf,
-                         w.off + w.hdrlen, TIBMSG_TYPE_ID );
-    }
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* omm nets (SPEC Milestone 4).  Feed side: the RWF envelope class
- * replaces the MSG_TYPE sniff and the payload converts to sass RVMSG at
- * ingest, then runs the normal handle_tic path -- one conversion,
- * existing cache/merge/seqno/forward machinery unchanged (field-list-
- * native caching is the later optimization; SPEC "RWF / OMM nets").
- * Provider side: OMM client streams are a third interest source; ticks
- * convert sass -> RWF once and EvOmmConn stamps per-client stream ids. */
-
-bool
-RvCache::omm_wild_match( uint32_t net,  const char *subj,
-                         size_t len ) noexcept
-{
-  const char * w = this->omm_wild[ net - 1 ];
-  if ( w == NULL || w[ 0 ] == '\0' )
-    return true;
-  size_t n = 0;
-  while ( w[ n ] != '\0' && w[ n ] != '>' )
-    n++;
-  if ( w[ n ] == '>' ) /* prefix match up to '>' (RSF.> style) */
-    return len >= n && ::memcmp( subj, w, n ) == 0;
-  return len == n && ::memcmp( subj, w, n ) == 0;
-}
-
-bool
-RvCache::on_omm_feed_msg( uint32_t net,  const char *subj,  size_t len,
-                          RwfMsg &m ) noexcept
-{
-  bool     has_seq    = m.msg.test( X_HAS_SEQ_NUM );
-  uint32_t seq_num    = (uint32_t) ( has_seq ? m.msg.seq_num : 0 );
-  RwfMsg * fields     = m.get_container_msg();
-  uint16_t msg_type,
-           rec_status = MD_OK_STATUS;
-
-  if ( m.msg.msg_class == REFRESH_MSG_CLASS )
-    msg_type = MD_INITIAL_TYPE;
-  else if ( m.msg.msg_class == STATUS_MSG_CLASS ) {
-    /* CLOSED / CLOSED_RECOVER -> drop (evict); stale/suspect -> forward
-     * the status, keep the image (SPEC feed-side mapping) */
-    if ( m.msg.state.stream_state != STREAM_STATE_OPEN )
-      msg_type = MD_DROP_TYPE;
-    else
-      msg_type = MD_TRANSIENT_TYPE;
-    rec_status = rwf_code_to_sass_rec_status( m );
-  }
-  else
-    msg_type = rwf_to_sass_msg_type( m );
-
-  /* build the sass-form RVMSG: header fields first (normalize keeps
-   * MSG_TYPE leading), then the field list converted through the
-   * generic writer.  The payload may itself carry an embedded sass
-   * header (bridged feeds): convert_msg( ..., true ) skips it and the
-   * envelope-derived header above stands. */
-  MDMsgMem mem;
-  size_t   sz  = ( fields != NULL ? ( m.msg_end - m.msg_off ) : 0 ) + 1024;
-  void   * bp  = mem.make( sz );
-  RvMsgWriter w( mem, bp, sz );
-  w.append_uint( MD_SASS_MSG_TYPE, MD_SASS_MSG_TYPE_LEN, msg_type );
-  if ( has_seq )
-    w.append_uint( MD_SASS_SEQ_NO, MD_SASS_SEQ_NO_LEN, seq_num );
-  w.append_uint( MD_SASS_REC_STATUS, MD_SASS_REC_STATUS_LEN, rec_status );
-  int status = 0;
-  if ( fields != NULL )
-    status = w.convert_msg( *fields, true );
-  size_t out = w.update_hdr();
-  if ( status != 0 || w.err != 0 ) {
-    fprintf( stderr, "omm feed(net%u): convert %.*s failed (%d)\n", net,
-             (int) len, subj, status != 0 ? status : w.err );
-    return true;
-  }
-  this->handle_tic( subj, len, w.buf, out, RVMSG_TYPE_ID, true, msg_type );
-  return true;
-}
-
-void
-RvCache::omm_feed_ready( uint32_t net ) noexcept
-{
-  EvOmmClient * c = this->omm_conns[ net - 1 ];
-  if ( c == NULL )
-    return;
-  this->omm_feeds |= (uint64_t) 1 << ( net - 1 );
-  /* replay every live-interest subject eligible under the wildcard
-   * (ready fires after directory+dictionary; stream ids are fresh) */
-  kv::RouteLoc loc;
-  CacheEntry * e = this->cache.tab.first( loc );
-  bool         any = false;
-  for ( ; e != NULL; e = this->cache.tab.next( loc ) ) {
-    if ( e->fwd_mask != 0 &&
-         this->omm_wild_match( net, e->value, e->len ) ) {
-      c->subscribe( e->value, e->len );
-      any = true;
-    }
-  }
-  /* cross-socket sends: send_msg() only buffers (append_iov); the
-   * writer side must be scheduled explicitly when the call originates
-   * in another socket's dispatch context */
-  if ( any )
-    c->idle_push_write();
-}
-
-void
-RvCache::omm_feed_subscribe( const char *subj,  size_t len ) noexcept
-{
-  for ( uint64_t m = this->omm_feeds; m != 0; m &= m - 1 ) {
-    uint32_t i = kv_ffsl( m ) - 1;
-    if ( this->omm_conns[ i ] != NULL &&
-         this->omm_wild_match( i + 1, subj, len ) ) {
-      this->omm_conns[ i ]->subscribe( subj, len );
-      this->omm_conns[ i ]->idle_push_write(); /* cross-socket flush */
-    }
-  }
-}
-
-void
-RvCache::omm_feed_unsubscribe( const char *subj,  size_t len ) noexcept
-{
-  for ( uint64_t m = this->omm_feeds; m != 0; m &= m - 1 ) {
-    uint32_t i = kv_ffsl( m ) - 1;
-    if ( this->omm_conns[ i ] != NULL &&
-         this->omm_wild_match( i + 1, subj, len ) ) {
-      this->omm_conns[ i ]->unsubscribe( subj, len );
-      this->omm_conns[ i ]->idle_push_write(); /* cross-socket flush */
-    }
-  }
-}
-
 /* interest edges: the upstream omm subscription follows the TOTAL
  * fwd_mask 0 <-> nonzero transition (any sub net, any protocol) */
 void
@@ -901,160 +335,6 @@ RvCache::interest_edge_clear( const char *subj,  size_t len,
   ce = this->cache.find( subj, len );
   if ( old_mask != 0 && ( ce == NULL || ce->fwd_mask == 0 ) )
     this->omm_feed_unsubscribe( subj, len );
-}
-
-/* provider side: an OMM client's item stream open/close (NotifySub with
- * src_type 'O' from EvOmmConn::add_subj_stream) is interest like any
- * other -- same lifecycle the RV LISTEN advisories drive */
-void
-RvCache::on_omm_sub( NotifySub &sub,  uint32_t net ) noexcept
-{
-  const char * subj = sub.subject;
-  size_t       len  = sub.subject_len;
-  if ( len == 0 || subj[ 0 ] == '_' )
-    return;
-  this->interest_edge_set( subj, len, net );
-  this->stats.subscription_starts++;
-  this->stats.subscriptions_active++;
-  this->acct_event( "subscribe", subj, len, NULL, "omm", 0,
-                    NULL, 0, 0, 0 );
-  /* solicited initial from the cache when an image exists; else STATUS
-   * suspect/open -- interest stays registered, a later INITIAL
-   * refreshes (spec 2: miss -> status, never silence) */
-  CacheEntry * e = this->find_for_image( subj, len );
-  void   * img;
-  size_t   img_len;
-  uint32_t img_enc;
-  if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) ) {
-    this->omm_forward( subj, len, img, img_len, img_enc,
-                       MD_INITIAL_TYPE, e->last_seqno, true );
-    e->snap_count++;
-    this->stats.initials_sent++;
-    this->acct_event( "initial", subj, len, NULL, "omm", 0,
-                      NULL, 0, 0, 0 );
-  }
-  else {
-    this->omm_send_status( subj, len, false );
-    this->stats.initials_not_found++;
-  }
-}
-
-void
-RvCache::on_omm_unsub( NotifySub &sub,  uint32_t net ) noexcept
-{
-  const char * subj = sub.subject;
-  size_t       len  = sub.subject_len;
-  if ( len == 0 || subj[ 0 ] == '_' )
-    return;
-  this->interest_edge_clear( subj, len, net );
-  if ( this->stats.subscriptions_active > 0 )
-    this->stats.subscriptions_active--;
-  this->stats.subscription_stops++;
-  this->acct_event( "unsubscribe", subj, len, NULL, "omm", 0,
-                    "stream_close", 0, 0, 0 );
-}
-
-/* convert a sass-form tick/image to one canonical RWF envelope and
- * publish it; every subscribed EvOmmConn copies it per client and
- * stamps its own stream id (sub.cpp), so this runs ONCE per tick no
- * matter how many OMM clients are attached */
-void
-RvCache::omm_forward( const char *subj,  size_t len,  const void *msg,
-                      size_t msg_len,  uint32_t enc,  uint16_t msg_type,
-                      uint32_t seqno,  bool solicited ) noexcept
-{
-  if ( this->omm_dict == NULL || this->omm_dict->rdm_dict == NULL ||
-       this->omm_listener == NULL )
-    return;
-  if ( msg_type == MD_TRANSIENT_TYPE || msg_type == MD_DROP_TYPE ) {
-    this->omm_send_status( subj, len, msg_type == MD_DROP_TYPE );
-    return;
-  }
-  MDMsgMem mem;
-  MDMsg * m = MDMsg::unpack( (void *) msg, 0, msg_len, enc,
-                             this->cache.dict.dict, mem );
-  if ( m == NULL )
-    return;
-  bool is_refresh = ( msg_type == MD_INITIAL_TYPE ||
-                      msg_type == MD_SNAPSHOT_TYPE ||
-                      msg_type == MD_VERIFY_TYPE );
-  uint32_t h  = kv_crc_c( subj, len, 0 );
-  size_t   sz = msg_len + 1024;
-  void   * bp = mem.make( sz );
-  RwfMsgWriter em( mem, this->omm_dict->rdm_dict, bp, sz,
-                   is_refresh ? REFRESH_MSG_CLASS : UPDATE_MSG_CLASS,
-                   MARKET_PRICE_DOMAIN, h );
-  RwfFieldListWriter * fl;
-  if ( is_refresh ) {
-    if ( solicited )
-      em.set( X_CLEAR_CACHE, X_SOLICITED, X_REFRESH_COMPLETE );
-    else
-      em.set( X_CLEAR_CACHE, X_REFRESH_COMPLETE );
-    em.add_seq_num( seqno )
-      .add_state( DATA_STATE_OK, STREAM_STATE_OPEN )
-      .add_msg_key()
-        .service_id( this->cfg.omm_service_id )
-        .name( subj, len )
-        .name_type( NAME_TYPE_RIC )
-      .end_msg_key();
-    fl = &em.add_field_list();
-  }
-  else {
-    em.add_seq_num( seqno )
-      .add_msg_key()
-        .service_id( this->cfg.omm_service_id )
-        .name( subj, len )
-        .name_type( NAME_TYPE_RIC )
-      .end_msg_key();
-    fl = &em.add_update( UPD_TYPE_QUOTE )
-            .add_field_list();
-  }
-  /* payload: the sass fields minus the sass header (skip_hdr); the
-   * convert belongs to the FIELD LIST writer (the envelope writer's
-   * convert_msg is the unimplemented base = NO_MSG_IMPL) */
-  int status = fl->convert_msg( *m, true );
-  size_t off = em.end_msg();
-  if ( status != 0 || em.err != 0 ) {
-    fprintf( stderr, "omm fwd %.*s: convert failed (%d)\n",
-             (int) len, subj, status != 0 ? status : em.err );
-    return;
-  }
-  EvPublish pub( subj, len, NULL, 0, em.buf, off,
-                 this->poll.sub_route, *this->omm_listener, h,
-                 RWF_MSG_TYPE_ID );
-  this->poll.sub_route.forward_msg( pub, NULL );
-}
-
-/* miss / drop status to OMM streams: suspect+open keeps the stream
- * (image may arrive later, mirroring rv5 interest-stays semantics);
- * closed tears it down (instrument death) */
-void
-RvCache::omm_send_status( const char *subj,  size_t len,
-                          bool closed ) noexcept
-{
-  if ( this->omm_dict == NULL || this->omm_dict->rdm_dict == NULL ||
-       this->omm_listener == NULL )
-    return;
-  MDMsgMem mem;
-  size_t   sz = 1024;
-  void   * bp = mem.make( sz );
-  uint32_t h  = kv_crc_c( subj, len, 0 );
-  RwfMsgWriter em( mem, this->omm_dict->rdm_dict, bp, sz,
-                   STATUS_MSG_CLASS, MARKET_PRICE_DOMAIN, h );
-  em.add_state( DATA_STATE_SUSPECT,
-                closed ? STREAM_STATE_CLOSED : STREAM_STATE_OPEN )
-    .add_msg_key()
-      .service_id( this->cfg.omm_service_id )
-      .name( subj, len )
-      .name_type( NAME_TYPE_RIC )
-    .end_msg_key();
-  size_t off = em.end_msg();
-  if ( em.err != 0 )
-    return;
-  EvPublish pub( subj, len, NULL, 0, em.buf, off,
-                 this->poll.sub_route, *this->omm_listener, h,
-                 RWF_MSG_TYPE_ID );
-  this->poll.sub_route.forward_msg( pub, NULL );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1413,107 +693,6 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
   }
 };
 
-/* omm feed net: connection lifecycle + inbound RWF messages.  ready
- * fires after login+directory+dictionary resolve (interest replays
- * there, never at TCP connect); loss is fail-fast like the rv nets */
-struct OmmFeedCB : public EvConnectionNotify, public OmmClientCB {
-  EvPoll      & poll;
-  EvOmmClient & client;
-  RvCache     & cache;
-  uint32_t      net;
-
-  OmmFeedCB( EvPoll &p,  EvOmmClient &c,  RvCache &rc,  uint32_t idx )
-    : poll( p ), client( c ), cache( rc ), net( idx ) {}
-
-  virtual void on_connect( EvSocket &conn ) noexcept {
-    printf( "omm feed(net%u) ready: %.*s\n", this->net,
-            (int) conn.get_peer_address_strlen(), conn.peer_address.buf );
-    this->cache.omm_feed_ready( this->net );
-  }
-  virtual void on_shutdown( EvSocket &conn,  const char *err,
-                            size_t errlen ) noexcept {
-    fprintf( stderr, "omm feed(net%u) shutdown: %.*s %.*s\n", this->net,
-             (int) conn.get_peer_address_strlen(), conn.peer_address.buf,
-             (int) errlen, err != NULL ? err : "" );
-    if ( this->poll.quit == 0 )
-      this->poll.quit = 1; /* fail-fast, like the rv nets */
-  }
-  virtual bool on_omm_msg( const char *sub,  size_t sub_len,  uint32_t,
-                           RwfMsg &msg ) noexcept {
-    return this->cache.on_omm_feed_msg( this->net, sub, sub_len, msg );
-  }
-};
-
-/* omm provider net: an OMM client's item stream open/close surfaces as
- * NotifySub (src_type 'O', EvOmmConn::add_subj_stream) on the
- * listener's sub_route; everything else on that route is ignored */
-struct OmmSubNotify : public RouteNotify {
-  RvCache & cache;
-  uint32_t  net;
-
-  OmmSubNotify( RoutePublish &sr,  RvCache &rc,  uint32_t idx )
-    : RouteNotify( sr ), cache( rc ), net( idx ) {}
-
-  virtual void on_sub( NotifySub &sub ) noexcept {
-    if ( sub.src_type == 'O' )
-      this->cache.on_omm_sub( sub, this->net );
-  }
-  virtual void on_unsub( NotifySub &sub ) noexcept {
-    if ( sub.src_type == 'O' )
-      this->cache.on_omm_unsub( sub, this->net );
-  }
-};
-
-/* announce the cache's service in a provider-side source directory:
- * build the RWF directory map exactly the way a wire directory response
- * looks and run it through update_source_map(), which constructs the
- * OmmSource AND the sector routes subject matching resolves against
- * (TestPublish::add_test_source is the model; add_source() alone does
- * not build sector routes) */
-static bool
-announce_cache_service( OmmSourceDB &db,  MDDict *rdm_dict,
-                        const char *svc,  uint32_t service_id ) noexcept
-{
-  static const char * dict_nm[ 2 ] = { "RWFFld", "RWFEnum" };
-  static uint8_t cap[ 2 ] = { SOURCE_DOMAIN, MARKET_PRICE_DOMAIN };
-  static RwfQos  qos      = { QOS_TIME_REALTIME, QOS_RATE_TICK_BY_TICK,
-                              0, 0, 0 };
-  char         buf[ 1024 ];
-  MDMsgMem     mem;
-  RwfMapWriter map( mem, rdm_dict, buf, sizeof( buf ) );
-  RwfState     state = { STREAM_STATE_OPEN, DATA_STATE_OK, 0, { "OK", 2 } };
-
-  RwfFilterListWriter
-    & fil = map.add_filter_list( MAP_ADD_ENTRY, service_id, MD_UINT );
-  fil.add_element_list( FILTER_SET_ENTRY, DIR_SVC_INFO_ID )
-     .append_string( NAME        , svc )
-     .append_string( VEND        , "rvcache" )
-     .append_uint  ( IS_SRC      , 1 )
-     .append_array ( CAPAB       , cap , 2, MD_UINT )
-     .append_array ( DICT_PROV   , dict_nm, 2 )
-     .append_array ( DICT_USED   , dict_nm, 2 )
-     .append_array ( QOS         , &qos, 1 )
-     .append_uint  ( SUP_QOS_RNG , 0 )
-     .append_string( ITEM_LST    , "_ITEM_LIST" )
-     .append_uint  ( SUP_OOB_SNAP, 1 )
-     .append_uint  ( ACC_CONS_STA, 0 )
-   .end_element_list();
-  fil.add_element_list( FILTER_SET_ENTRY, DIR_SVC_STATE_ID )
-     .append_uint  ( SVC_STATE, 1 )
-     .append_uint  ( ACC_REQ  , 1 )
-     .append_state ( STAT     , state )
-   .end_element_list();
-  map.end_map();
-  if ( map.err != 0 )
-    return false;
-  RwfMsg * m = RwfMsg::unpack_map( map.buf, 0, map.off, RWF_MAP_TYPE_ID,
-                                   NULL, mem );
-  if ( m == NULL )
-    return false;
-  db.update_source_map( kv::current_realtime_ns(), *m );
-  return true;
-}
-
 /* ------------------------------------------------------------------ */
 static const char *
 get_arg( int &x,  int argc,  const char *argv[],  int b,  const char *f,
@@ -1555,7 +734,7 @@ main( int argc,  const char *argv[] )
   if ( help != NULL ) {
     fprintf( stderr,
       "rv_cache [-d daemon] [-n network] [-s service] (defaults)\n"
-      "  [-<idx> role proto[ daemon[ network[ service[ wildcard]]]]] net\n"
+      "  [-N role proto[ daemon[ network[ service[ wildcard]]]]] net (repeat)\n"
       "  [-p path]             = dictionary search path\n"
       "  [-c file]             = json/yaml config (.yaml/.yml = yaml)\n"
       "  [-m map_name]         = shm name to cache msgs\n"
@@ -1569,27 +748,23 @@ main( int argc,  const char *argv[] )
       "  [-v]                  = verbose submgr log\n"
       "\n"
       "example:\n"
-      "rv_cache -1 sub sass2 tcp:7500 'eth0;227.5.0.0' 7500 'RSF.>' \\\n"
-      "         -2 feed sass2 tcp:7600 'eth1;227.6.0.0' 7600 'RSF.>' \\\n"
+      "rv_cache -N sub sass2 tcp:7500 'eth0;227.5.0.0' 7500 'RSF.>' \\\n"
+      "         -N feed sass2 tcp:7600 'eth1;227.6.0.0' 7600 'RSF.>' \\\n"
       "         -c cache.yaml \\\n"
       "         -m sysv:raikv.shm \\\n"
       "         -A subscript.log\n" );
     return 1;
   }
 
-  /* -<idx> role proto [d [n [s [wild]]]] net attachments, argv-separated
-   * (network configs contain commas); fields run to the next -flag */
+  /* -N role proto [d [n [s [wild]]]] net attachments, argv-separated
+   * (network configs contain commas); fields run to the next -flag.
+   * Nets are numbered by position: -N flags in argv order, then the -c
+   * file's nets array in file order (mask bit = position - 1) */
   for ( int i = 1; i < argc - 1; i++ ) {
     const char * a = argv[ i ];
     int j;
-    if ( a[ 0 ] != '-' || a[ 1 ] < '0' || a[ 1 ] > '9' )
+    if ( ::strcmp( a, "-N" ) != 0 )
       continue;
-    char * end = NULL;
-    long   idx = ::strtol( &a[ 1 ], &end, 10 );
-    if ( *end != '\0' || idx < 1 || idx > (long) MAX_NETS ) {
-      fprintf( stderr, "bad net index: %s (1..%u)\n", a, MAX_NETS );
-      return 1;
-    }
     for ( j = 0; j + i + 1 < argc; j++ ) {
       if ( argv[ j + i + 1 ][ 0 ] == '-' )
         break;
@@ -1598,11 +773,16 @@ main( int argc,  const char *argv[] )
       fprintf( stderr, "zero net config: %s\n", a );
       return 1;
     }
+    if ( cfg.nets.count >= MAX_NETS ) {
+      fprintf( stderr, "too many nets (max %u)\n", MAX_NETS );
+      return 1;
+    }
     NetDef nd;
-    if ( ! parse_net_tuple( (uint32_t) idx, &argv[ i + 1 ], (uint32_t) j, nd ) ) {
+    if ( ! parse_net_tuple( (uint32_t) cfg.nets.count + 1, &argv[ i + 1 ],
+                            (uint32_t) j, nd ) ) {
       fprintf( stderr,
         "bad net tuple: %s %s (want role proto[ daemon[ network[ service [wild]]]],"
-        " role feed|sub, proto sass2|sass3|both)\n", a, argv[ i + 1 ] );
+        " role feed|sub, proto sass2|sass3|both|omm)\n", a, argv[ i + 1 ] );
       return 1;
     }
     cfg.nets.push( nd );
@@ -1633,19 +813,11 @@ main( int argc,  const char *argv[] )
     cfg.nets.push( f );
     cfg.nets.push( s );
   }
-  /* validate: unique indexes, at least one sub */
+  /* validate: at least one sub */
   {
-    uint64_t seen = 0;
-    bool     have_sub = false;
+    bool have_sub = false;
     for ( size_t i = 0; i < cfg.nets.count; i++ ) {
-      NetDef &nd = cfg.nets.ptr[ i ];
-      uint64_t bit = (uint64_t) 1 << ( nd.idx - 1 );
-      if ( ( seen & bit ) != 0 ) {
-        fprintf( stderr, "duplicate net index %u\n", nd.idx );
-        return 1;
-      }
-      seen |= bit;
-      if ( ! nd.is_feed )
+      if ( ! cfg.nets.ptr[ i ].is_feed )
         have_sub = true;
     }
     if ( ! have_sub ) {
@@ -1658,20 +830,14 @@ main( int argc,  const char *argv[] )
 
   /* omm nets need the RDM dictionary (fname <-> fid is not optional for
    * the sass <-> RWF conversion); refuse a fid-blind omm net (SPEC M4) */
-  OmmDict omm_dict;
-  bool    have_omm = false;
+  bool have_omm = false;
   for ( size_t i = 0; i < cfg.nets.count; i++ )
     if ( cfg.nets.ptr[ i ].omm )
       have_omm = true;
-  if ( have_omm ) {
-    if ( cfg.dict_path != NULL )
-      omm_dict.load_cfiles( cfg.dict_path );
-    if ( omm_dict.rdm_dict == NULL ) {
-      fprintf( stderr, "omm nets require an RDM dictionary (-p path)\n" );
-      return 1;
-    }
+  if ( have_omm && dict.rdm_dict == NULL ) {
+    fprintf( stderr, "omm nets require an RDM dictionary (-p path)\n" );
+    return 1;
   }
-
   EvShm  shm( "rv_cache" );
   if ( shm.open( cfg.map_name, 0 ) != 0 )
     return 1;
@@ -1681,7 +847,6 @@ main( int argc,  const char *argv[] )
 
   RvCache cache( poll, shm, dict, cfg );
   if ( have_omm ) {
-    cache.omm_dict = &omm_dict;
     if ( cfg.verbose )
       omm_debug = 1; /* omm lib dispatch traces with -v */
   }
@@ -1722,7 +887,7 @@ main( int argc,  const char *argv[] )
         OmmSourceDB * db = new ( ::malloc( sizeof( OmmSourceDB ) ) )
                            OmmSourceDB();
         EvOmmClient * oc = new ( aligned_malloc( sizeof( EvOmmClient ) ) )
-                           EvOmmClient( poll, omm_dict, *db );
+                           EvOmmClient( poll, dict, *db );
         OmmFeedCB   * ocb = new ( aligned_malloc( sizeof( OmmFeedCB ) ) )
                             OmmFeedCB( poll, *oc, cache, nd.idx );
         /* login attrs need non-NULL defaults: the login request's msg
@@ -1758,7 +923,7 @@ main( int argc,  const char *argv[] )
         OmmSourceDB * db = new ( ::malloc( sizeof( OmmSourceDB ) ) )
                            OmmSourceDB();
         EvOmmListen * ol = new ( aligned_malloc( sizeof( EvOmmListen ) ) )
-                           EvOmmListen( poll, omm_dict, *db );
+                           EvOmmListen( poll, dict, *db );
         if ( ol->listen( NULL, port, DEFAULT_TCP_LISTEN_OPTS ) != 0 ) {
           fprintf( stderr, "Failed to listen net %u (omm, port %d)\n",
                    nd.idx, port );
@@ -1767,7 +932,7 @@ main( int argc,  const char *argv[] )
         /* announce the cache's one service in the source directory
          * (directory-map path: builds the sector routes matching uses) */
         const char * svc = ( s != NULL ? s : "RVCACHE" );
-        if ( ! announce_cache_service( *db, omm_dict.rdm_dict, svc,
+        if ( ! announce_cache_service( *db, dict.rdm_dict, svc,
                                        cfg.omm_service_id ) ) {
           fprintf( stderr, "net %u: omm service announce failed\n",
                    nd.idx );

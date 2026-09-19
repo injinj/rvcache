@@ -35,7 +35,7 @@ See [SPEC.md](SPEC.md) for the design document and
   (1..64), each an independent RV session with its own
   `(daemon, network, service)` and optional subject wildcard; they may
   be collapsed onto one rvd as a deployment choice. Declared on the
-  command line (`-<idx> role proto ...`) or in a json/yaml config file
+  command line (`-N role proto ...`) or in a json/yaml config file
   (`-c`), which also carries the less-common options as long-name keys.
 - **Sequence handling** — observe, strict, or stamp modes for SASS
   sequence numbers (`-Q`).
@@ -70,7 +70,7 @@ A debug build is available with `make port_extra=-g`.
 ```console
 $ rvcache -h
 rvcache [-d daemon] [-n network] [-s service] (defaults)
-  [-<idx> role proto[ daemon[ network[ service[ wildcard]]]]] net
+  [-N role proto[ daemon[ network[ service[ wildcard]]]]] net (repeat)
   [-p path]             = dictionary search path
   [-c file]             = json/yaml config (.yaml/.yml = yaml)
   [-m map_name]         = shm name to cache msgs
@@ -86,7 +86,8 @@ rvcache [-d daemon] [-n network] [-s service] (defaults)
 
 - `-d`, `-n`, `-s` set the default daemon / network / service for all
   attachments.
-- `-<idx>` declares a net attachment (idx 1..64): role `feed|sub`, proto
+- `-N` declares a net attachment (repeat it, up to 64; nets are numbered
+  by position -- CLI `-N` flags first, then the config `nets` array): role `feed|sub`, proto
   `sass2|sass3|both`, then optional daemon / network / service /
   wildcard. Fields are **argv-separated** (network configs contain
   commas) and run to the next `-flag`; pass `''` to skip a middle field
@@ -94,10 +95,10 @@ rvcache [-d daemon] [-n network] [-s service] (defaults)
   attachment: on a sub net it filters interest tracking, on a feed net
   it narrows the upstream subscription (`_TIC.<wild>.>` /
   `_SASS.<wild>.PUB`). Default topology when no nets are declared:
-  `-1 feed sass2 -2 sub both`.
+  `-N feed sass2 -N sub both`.
 - Only the important knobs are CLI flags. The `-c` json/yaml config
   file carries everything as long-name top-level keys — `daemon`,
-  `network`, `service`, `nets` (array of `{index, role, proto, daemon,
+  `network`, `service`, `nets` (array of `{role, proto, daemon,
   network, service, wildcard}`), `map_name`, `dict_path`,
   `replace_typeless_msgs`, `sequence_policy`, `route_after_merge`,
   `message_eviction_secs`, `pending_initial_secs`, `accounting_file`,
@@ -116,8 +117,8 @@ Cache between a feed rvd and a consumer rvd, forwarding only `RSF.>`
 subjects, with accounting to a file:
 
 ```console
-$ rvcache -1 sub sass2 tcp:7500 'eth0;227.5.0.0' 7500 'RSF.>' \
-          -2 feed sass2 tcp:7600 'eth1;227.6.0.0' 7600 'RSF.>' \
+$ rvcache -N sub sass2 tcp:7500 'eth0;227.5.0.0' 7500 'RSF.>' \
+          -N feed sass2 tcp:7600 'eth1;227.6.0.0' 7600 'RSF.>' \
           -c cache.yaml -m sysv:raikv.shm -A subscript.log
 ```
 

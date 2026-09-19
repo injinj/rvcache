@@ -264,7 +264,7 @@ all_dlls    :=
 all_depends :=
 gen_files   :=
 
-rv_cache_files := rv_cache cache_tab config
+rv_cache_files := rv_cache sass2 sass3 omm cache_tab config
 rv_cache_cfile := $(addprefix src/, $(addsuffix .cpp, $(rv_cache_files)))
 rv_cache_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(rv_cache_files)))
 rv_cache_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(rv_cache_files)))

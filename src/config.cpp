@@ -77,8 +77,9 @@ parse_seq( const char *s ) noexcept
 /* json/yaml config file (-c).  Only the important knobs are CLI flags;
  * everything else is config-file only.  Top-level keys:
  *   daemon, network, service        base (d,n,s) triple        (-d -n -s)
- *   nets: [ {index, role, proto, daemon, network, service, wildcard} ]
- *                                   net attachments            (-<idx>)
+ *   nets: [ {role, proto, daemon, network, service, wildcard} ]
+ *                                   net attachments, numbered by position
+ *                                   after any CLI -N nets      (-N)
  *   map_name: str                   shm msg cache              (-m)
  *   dict_path: str                  dictionary search path     (-p)
  *   replace_typeless_msgs: bool     replace typeless ticks     (-r)
@@ -161,18 +162,15 @@ load_nets_array( const char *path,  JsonValue *root,  Config &cfg ) noexcept
       return false;
     }
     JsonObject * o = arr->val[ i ]->to_obj();
-    NetDef       nd;
-    int64_t      idx = 0;
-    JsonValue  * iv = o->find( "index" );
-    if ( iv == NULL || iv->to_int( idx ) != 0 || idx < 1 ||
-         idx > (int64_t) MAX_NETS ) {
-      fprintf( stderr, "%s: nets[%zu] needs \"index\" 1..%u\n", path, i,
+    if ( cfg.nets.count >= MAX_NETS ) {
+      fprintf( stderr, "%s: nets[%zu]: too many nets (max %u)\n", path, i,
                MAX_NETS );
       return false;
     }
+    NetDef       nd;
     const char * role  = json_str( o, "role" ),
                * proto = json_str( o, "proto" );
-    nd.idx = (uint32_t) idx;
+    nd.idx = (uint32_t) cfg.nets.count + 1; /* position after CLI -N nets */
     if ( ! parse_role_proto( nd, role, proto ) ) {
       fprintf( stderr, "%s: nets[%zu] bad role/proto\n", path, i );
       return false;

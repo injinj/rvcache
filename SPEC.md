@@ -44,7 +44,7 @@ the compat/bridge case, matching that reality.
 ## Network topology — RV attachment roles
 
 An rvcache process attaches to any number of RV networks (1..64), each
-declared as `-<idx> role proto [daemon [network [service [wildcard]]]]`
+declared as `-N role proto [daemon [network [service [wildcard]]]]`
 (argv-separated fields — network configs like `eth0;227.5.0.0,227.5.0.1`
 contain commas, so a comma-joined tuple cannot carry them) or an entry
 in the `-c` json/yaml `nets` array. Each attachment is its
@@ -54,7 +54,7 @@ identical** — collapsing any or all attachments onto one physical
 rvd/network is a deployment choice, not a design assumption. The code
 never assumes two roles share a session, and never requires them to be
 distinct either. Default topology when nothing is declared:
-`-1 feed sass2 -2 sub both`.
+`-N feed sass2 -N sub both`.
 
 | role/proto | rvcache role | Traffic |
 |------------|--------------|---------|
@@ -232,11 +232,11 @@ sassrv test programs.
 
 ### 1. Transports: one `EvRvClient` per declared net
 
-One client session per declared attachment (`-<idx> role proto ...` or
+One client session per declared attachment (`-N role proto ...` or
 `-c` nets array), all on the one `EvPoll`. Base `-d daemon`, `-n network`,
 `-s service` flags set the default triple; empty per-net d/n/s fields
 fall back to them. Only declared attachments are created; at least one
-sub net is required, and duplicate indexes are rejected.
+sub net is required.
 
 Subscriptions per attachment:
 
@@ -288,11 +288,12 @@ struct SubCB : public RvSubscriptionListener { /* one per sub net */
   per net in `CacheEntry::fwd_mask`), and each
   submgr asserts and broadcasts initials on its own refcnt 0→1
   independently. **Implemented as arbitrary network attachments:**
-  `-<idx> role proto [daemon [network [service [wildcard]]]]`
-  (argv-separated fields running to the next `-flag`; idx 1..64, role
+  `-N role proto [daemon [network [service [wildcard]]]]`
+  (argv-separated fields running to the next `-flag`; repeatable, up to 64,
+  numbered by position; role
   `feed|sub`, proto `sass2|sass3|both`, empty-string d/n/s fields fall
   back to `-d/-n/-s`), or `-c file` with a json/yaml `nets` array of
-  `{index, role, proto, daemon, network, service, wildcard}` objects —
+  `{role, proto, daemon, network, service, wildcard}` objects —
   the config file also carries every other option as a long-name
   top-level key (see CLI section; explicit CLI flags override file
   values).
@@ -308,7 +309,7 @@ struct SubCB : public RvSubscriptionListener { /* one per sub net */
   filter set). Any number
   of feed and sub networks; every sub net is one `SubCB` + one submgr,
   differing only in the `start_subscriptions` enables. Default topology
-  when nothing is declared: `-1 feed sass2 -2 sub both` (collapsed).
+  when nothing is declared: `-N feed sass2 -N sub both` (collapsed).
 - **Forwarding gate = per-net bitmask on the cache entry.**
   `CacheEntry::fwd_mask` holds one forwarding bool per net (bit =
   idx−1): a subscribe callback with `refcnt > 0` sets the net's bit, an
@@ -707,7 +708,7 @@ rvcache [-d daemon] [-n network] [-s service]   defaults for all nets
                           -4 sub sass3 tcp:7501 '' 7501 'RSF.>'
         [-c file]         json/yaml config (.yaml/.yml = yaml): long-name
                           top-level keys — daemon, network, service,
-                          nets: [{index,role,proto,daemon,network,
+                          nets: [{role,proto,daemon,network,
                           service,wildcard},...], map_name, dict_path,
                           replace_typeless_msgs, sequence_policy,
                           route_after_merge, message_eviction_secs,

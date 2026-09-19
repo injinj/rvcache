@@ -31,11 +31,13 @@ struct NetParm {
 
 static const uint32_t MAX_NETS = 64; /* fwd_mask is 64 bits */
 
-/* one network attachment: -<idx> role proto [daemon [network [service
+/* one network attachment: -N role proto [daemon [network [service
  * [wildcard]]]] (argv-separated -- network configs contain commas) or an
- * entry in the -c json/yaml nets array.  mask bit = idx - 1 */
+ * entry in the -c json/yaml nets array.  Numbered by position: CLI -N
+ * flags in argv order, then the nets array in file order.
+ * mask bit = idx - 1 */
 struct NetDef {
-  uint32_t idx;      /* CLI integer, 1 .. MAX_NETS */
+  uint32_t idx;      /* position, 1 .. MAX_NETS */
   bool     is_feed,  /* feed | sub */
            s2,       /* sass2: feed = _TIC broadcast consumer;
                       *        sub  = _RV.INFO advisories + _SNAP */
