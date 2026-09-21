@@ -361,6 +361,7 @@ RvCache::on_timer( void ) noexcept
     }
   }
 
+  this->omm_pending_check();
   if ( ! this->cfg.quiet )
     this->print_stats( false );
 }
@@ -672,8 +673,6 @@ struct SubCB : public EvConnectionNotify, public RvClientCB,
   }
   virtual bool timer_cb( uint64_t,  uint64_t ) noexcept {
     this->sub_db.process_events();
-    if ( this->primary )
-      this->cache.on_timer();
     return true;
   }
   virtual void on_listen_start( Start &add ) noexcept {
@@ -978,6 +977,20 @@ main( int argc,  const char *argv[] )
       }
     }
   }
+
+  /* the cache's own 1s timer (eviction, omm pending timeouts, stats);
+   * previously the first rv sub net's timer, which an omm-only topology
+   * never started */
+  struct CacheTimer : public EvTimerCallback {
+    RvCache & cache;
+    CacheTimer( RvCache &c ) : cache( c ) {}
+    virtual bool timer_cb( uint64_t,  uint64_t ) noexcept {
+      this->cache.on_timer();
+      return true;
+    }
+  };
+  CacheTimer cache_timer( cache );
+  poll.timer.add_timer_millis( cache_timer, 1000, 1, 0 );
 
   sighndl.install();
   int idle_count = 0;

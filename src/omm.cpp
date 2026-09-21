@@ -160,8 +160,10 @@ RvCache::omm_feed_unsubscribe( const char *subj,  size_t len ) noexcept
 }
 
 /* provider side: an OMM client's item stream open/close (NotifySub with
- * src_type 'O' from EvOmmConn::add_subj_stream) is interest like any
- * other -- same lifecycle the RV LISTEN advisories drive */
+ * src_type 'O' from EvOmmService::request_stream) is interest like any
+ * other -- same lifecycle the RV LISTEN advisories drive.  The first
+ * stream on a subject arrives here; more streams / reissues on it arrive
+ * as on_omm_resub (route table ADD_REF) */
 void
 RvCache::on_omm_sub( NotifySub &sub,  uint32_t net ) noexcept
 {
@@ -175,9 +177,27 @@ RvCache::on_omm_sub( NotifySub &sub,  uint32_t net ) noexcept
   this->stats.subscriptions_active++;
   this->acct_event( "subscribe", subj, len, NULL, "omm", 0,
                     NULL, 0, 0, 0 );
-  /* solicited initial from the cache when an image exists; else STATUS
-   * suspect/open -- interest stays registered, a later INITIAL
-   * refreshes (spec 2: miss -> status, never silence) */
+  this->omm_send_initial( subj, len );
+}
+
+void
+RvCache::on_omm_resub( NotifySub &sub,  uint32_t ) noexcept
+{
+  const char * subj = sub.subject;
+  size_t       len  = sub.subject_len;
+  if ( len == 0 || subj[ 0 ] == '_' )
+    return;
+  this->acct_event( "resubscribe", subj, len, NULL, "omm", 0,
+                    NULL, 0, 0, 0 );
+  this->omm_send_initial( subj, len );
+}
+
+/* solicited initial from the cache when an image exists; else STATUS
+ * suspect/open -- interest stays registered, a later INITIAL refreshes
+ * (spec 2: miss -> status, never silence) or the pending timer closes it */
+void
+RvCache::omm_send_initial( const char *subj,  size_t len ) noexcept
+{
   CacheEntry * e = this->find_for_image( subj, len );
   void   * img;
   size_t   img_len;
@@ -193,6 +213,59 @@ RvCache::on_omm_sub( NotifySub &sub,  uint32_t net ) noexcept
   else {
     this->omm_send_status( subj, len, false );
     this->stats.initials_not_found++;
+    this->omm_pending_add( subj, len );
+  }
+}
+
+void
+RvCache::omm_pending_add( const char *subj,  size_t len ) noexcept
+{
+  if ( this->cfg.pending_initial_secs == 0 )
+    return;
+  RouteLoc loc;
+  uint32_t h = kv_crc_c( subj, len, 0 );
+  OmmPending * p = this->omm_pending.upsert( h, subj, len, loc );
+  if ( p != NULL && loc.is_new )
+    p->open_ns = this->now_ns();
+}
+
+/* on_timer: a pending subject whose image arrived is done (the feed's
+ * INITIAL was forwarded as an unsolicited refresh, which satisfies the
+ * waiting streams); one that outlived pending_initial_secs is closed
+ * NOT_FOUND on every OMM stream, as an ADS does for an unanswered item */
+void
+RvCache::omm_pending_check( void ) noexcept
+{
+  if ( this->omm_pending.pop_count() == 0 )
+    return;
+  uint64_t cutoff = this->now_ns() -
+                    (uint64_t) this->cfg.pending_initial_secs * 1000000000ULL;
+  RouteLoc loc;
+  for ( OmmPending * p = this->omm_pending.first( loc ); p != NULL; ) {
+    char   tmp[ 1024 ];
+    size_t l = p->len < sizeof( tmp ) ? p->len : sizeof( tmp ) - 1;
+    ::memcpy( tmp, p->value, l );
+    bool done = false;
+    CacheEntry * e = this->find_for_image( tmp, l );
+    void * img; size_t img_len; uint32_t img_enc;
+    if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) )
+      done = true;
+    else if ( p->open_ns < cutoff ) {
+      this->omm_send_status( tmp, l, true );
+      this->stats.initials_not_found++;
+      this->acct_event( "timeout", tmp, l, NULL, "omm", 0,
+                        "pending_initial", 0, 0, 0 );
+      done = true;
+    }
+    if ( done ) {
+      OmmPending * nxt = this->omm_pending.next( loc );
+      RouteLoc rm;
+      if ( this->omm_pending.find( kv_crc_c( tmp, l, 0 ), tmp, l, rm ) != NULL )
+        this->omm_pending.remove( rm );
+      p = nxt;
+      continue;
+    }
+    p = this->omm_pending.next( loc );
   }
 }
 
@@ -247,8 +320,11 @@ RvCache::omm_forward( const char *subj,  size_t len,  const void *msg,
       em.set( X_CLEAR_CACHE, X_SOLICITED, X_REFRESH_COMPLETE );
     else
       em.set( X_CLEAR_CACHE, X_REFRESH_COMPLETE );
+    uint8_t group_id[ 2 ] = { (uint8_t) ( this->cfg.omm_service_id >> 8 ),
+                              (uint8_t) this->cfg.omm_service_id };
     em.add_seq_num( seqno )
       .add_state( DATA_STATE_OK, STREAM_STATE_OPEN )
+      .add_group_id( group_id, sizeof( group_id ) )
       .add_msg_key()
         .service_id( this->cfg.omm_service_id )
         .name( subj, len )
@@ -298,8 +374,13 @@ RvCache::omm_send_status( const char *subj,  size_t len,
   uint32_t h  = kv_crc_c( subj, len, 0 );
   RwfMsgWriter em( mem, this->cache.dict.rdm_dict, bp, sz,
                    STATUS_MSG_CLASS, MARKET_PRICE_DOMAIN, h );
+  uint8_t group_id[ 2 ] = { (uint8_t) ( this->cfg.omm_service_id >> 8 ),
+                            (uint8_t) this->cfg.omm_service_id };
   em.add_state( DATA_STATE_SUSPECT,
-                closed ? STREAM_STATE_CLOSED : STREAM_STATE_OPEN )
+                closed ? STREAM_STATE_CLOSED : STREAM_STATE_OPEN,
+                closed ? "Not found" : "Pending image",
+                closed ? STATUS_CODE_NOT_FOUND : STATUS_CODE_NONE )
+    .add_group_id( group_id, sizeof( group_id ) )
     .add_msg_key()
       .service_id( this->cfg.omm_service_id )
       .name( subj, len )
@@ -346,6 +427,13 @@ OmmSubNotify::on_sub( NotifySub &sub ) noexcept
 {
   if ( sub.src_type == 'O' )
     this->cache.on_omm_sub( sub, this->net );
+}
+
+void
+OmmSubNotify::on_resub( NotifySub &sub ) noexcept
+{
+  if ( sub.src_type == 'O' )
+    this->cache.on_omm_resub( sub, this->net );
 }
 
 void

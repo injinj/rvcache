@@ -56,6 +56,16 @@ struct RvCache {
   uint64_t           omm_feeds,             /* mask: omm feed nets READY */
                      omm_subs;              /* mask: omm provider nets */
   EvOmmListen      * omm_listener;          /* provider listener */
+  /* omm streams opened on a subject with no image yet: the image arrives
+   * from a feed later (interest edge) or the request times out with a
+   * CLOSED / NOT_FOUND status after cfg.pending_initial_secs */
+  struct OmmPending {      /* RouteVec Data: trailing hash/len/value[] */
+    uint64_t open_ns;
+    uint32_t hash;
+    uint16_t len;
+    char     value[ 2 ];
+  };
+  rai::kv::RouteVec<OmmPending> omm_pending;
   FILE             * acct;
   char               pubbuf[ 64 * 1024 ];
 
@@ -113,7 +123,14 @@ struct RvCache {
    * tick flow (sass -> RWF once per tick; EvOmmConn stamps per-client
    * stream ids; SPEC Milestone 4 client side) */
   void on_omm_sub( NotifySub &sub,  uint32_t net ) noexcept;
+  /* another stream / a reissue on a subject already open: solicited
+   * image again, no interest change */
+  void on_omm_resub( NotifySub &sub,  uint32_t net ) noexcept;
   void on_omm_unsub( NotifySub &sub,  uint32_t net ) noexcept;
+  /* solicited initial from the cache, or STATUS suspect/open + pending */
+  void omm_send_initial( const char *subj,  size_t len ) noexcept;
+  void omm_pending_add( const char *subj,  size_t len ) noexcept;
+  void omm_pending_check( void ) noexcept; /* on_timer: expire pendings */
   void omm_forward( const char *subj,  size_t len,  const void *msg,
                     size_t msg_len,  uint32_t enc,  uint16_t msg_type,
                     uint32_t seqno,  bool solicited ) noexcept;
@@ -206,6 +223,7 @@ struct OmmSubNotify : public RouteNotify {
     : RouteNotify( sr ), cache( rc ), net( idx ) {}
 
   virtual void on_sub( NotifySub &sub ) noexcept;
+  virtual void on_resub( NotifySub &sub ) noexcept;
   virtual void on_unsub( NotifySub &sub ) noexcept;
 };
 
