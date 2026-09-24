@@ -487,6 +487,12 @@ RvCache::print_stats( bool final_totals ) noexcept
     for ( size_t i = 0; i < n; i++ ) {
       fputs( hdr[ i ], stdout ); fputs( "\n", stdout ); fputs( sta[ i ], stdout ); fputs( "\n", stdout );
     }
+    if ( final_totals && ( this->cache.stats_inplace | this->cache.stats_rebuild ) != 0 )
+      printf( "map merges: inplace=%llu rebuild=%llu compactions=%llu index_rebuilds=%llu avg=%.1fus\n",
+              (long long) this->cache.stats_inplace, (long long) this->cache.stats_rebuild,
+              (long long) this->cache.stats_compactions, (long long) this->cache.stats_index_rebuilds,
+              (double) this->cache.stats_map_ns / 1000.0 /
+              (double) ( this->cache.stats_inplace + this->cache.stats_rebuild ) );
     printf( "\n" );
     fflush( stdout );
   }

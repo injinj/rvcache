@@ -5,7 +5,10 @@
 #include <raimd/md_dict.h>
 #include <raimd/rv_msg.h>
 #include <raimd/sass.h>
+#include <raimd/rwf_msg.h>
+#include <raimd/rwf_writer.h>
 #include <raikv/key_hash.h>
+#include <raikv/util.h>
 
 using namespace rai;
 using namespace kv;
@@ -124,32 +127,24 @@ CacheTab::normalize_msg_type( const void *&bytes,  size_t &len,
 
 /* ------------------------------------------------------------------ */
 /* shm image store: subject-keyed values in the raikv map (-m map_name).
- * EvKeyCtx computes the 128-bit key hash from the map's seed and primes
- * KeyCtx (the same operand struct raids queues for prefetch, so the
- * Milestone 3 batching pipeline slots in without another refactor).
- * The value is the bare image bytes; the encoding rides in the
+ * The kv key is the NUL-terminated subject (keylen = len + 1, the
+ * EvKeyCtx / raids string-key convention, copied into keybuf) and
+ * its 128-bit hash from the map's seed is computed once per entry
+ * (CacheEntry::khash1/2); a prefetch pipeline (Milestone 3) can queue
+ * those hashes directly.  The value is the bare image bytes; the encoding rides in the
  * HashEntry's type byte ((uint8_t) TYPE_ID, matcher ftype convention),
  * the same slot raids uses for redis value types.  MDMsg::unpack()
  * accepts the byte as a msg_enc hint. */
 
-/* HashEntry type byte -> full raimd TYPE_ID (for EvPublish msg_enc /
- * make_rv_msg, which switch on the 32-bit ids).  Built once from the
- * registered matcher table; unknown bytes pass through unchanged. */
-static uint32_t
+/* the HashEntry type byte -> 32-bit msg_enc (publish paths switch on the
+ * full ids); raimd's matcher table owns the mapping (md_match_ftype[]
+ * indexes the registered codec, hint[0] is its id).  Unknown bytes pass
+ * through unchanged. */
+static inline uint32_t
 enc_of_type_byte( uint8_t b ) noexcept
 {
-  static uint32_t tab[ 256 ];
-  static bool     init;
-  if ( ! init ) {
-    uint32_t i = 0;
-    for ( MDMatch *ma = MDMsg::first_match( i ); ma != NULL;
-          ma = MDMsg::next_match( i ) ) {
-      if ( ma->hint_size > 0 && tab[ ma->ftype ] == 0 )
-        tab[ ma->ftype ] = ma->hint[ 0 ];
-    }
-    init = true;
-  }
-  return tab[ b ] != 0 ? tab[ b ] : b;
+  uint32_t id = MDMsg::type_id_of_ftype( b );
+  return id != 0 ? id : b;
 }
 
 void
@@ -163,19 +158,27 @@ CacheTab::init_shm( EvShm &shm ) noexcept
   this->map->hdr.get_hash_seed( this->kctx->db_num, this->hseed );
 }
 
-EvKeyCtx *
-CacheTab::key_of( const CacheEntry &e ) noexcept
+void
+CacheTab::set_key( CacheEntry &e,  KeyCtx &kc ) noexcept
 {
-  size_t sz = EvKeyCtx::size( e.len );
-  if ( sz > this->keybuf_len ) {
+  /* keylen counts the NUL (EvKeyCtx::copy_key convention): string keys
+   * stay readable by kv tooling and distinct from binary keys */
+  size_t need = sizeof( KeyFragment ) + e.len + 1;
+  if ( need > this->keybuf_len ) {
     size_t n = this->keybuf_len == 0 ? 256 : this->keybuf_len;
-    while ( n < sz )
+    while ( n < need )
       n *= 2;
     this->keybuf = (char *) ::realloc( this->keybuf, n );
     this->keybuf_len = n;
   }
-  return new ( this->keybuf )
-         EvKeyCtx( *this->map, NULL, e.value, e.len, 0, 0, this->hseed );
+  KeyFragment & kf = *(KeyFragment *) (void *) this->keybuf;
+  kf.keylen = (uint16_t) ( e.len + 1 );
+  ::memcpy( kf.u.buf, e.value, e.len );
+  kf.u.buf[ e.len ] = '\0';
+  if ( ( e.khash1 | e.khash2 ) == 0 )
+    this->hseed.hash( kf, e.khash1, e.khash2 );
+  kc.set_key( kf );
+  kc.set_hash( e.khash1, e.khash2 );
 }
 
 bool
@@ -183,7 +186,7 @@ CacheTab::shm_set( CacheEntry &e,  const void *bytes,  size_t len,
                    uint32_t enc ) noexcept
 {
   KeyCtx & kc = *this->kctx;
-  this->key_of( e )->set( kc );
+  this->set_key( e, kc );
   this->wrk.reset();
   KeyStatus status = kc.acquire( &this->wrk );
   if ( status <= KEY_IS_NEW ) {
@@ -212,7 +215,7 @@ CacheTab::shm_merge( CacheEntry &e,  const void *upd,  size_t upd_len,
   /* single-lock read-modify-write: acquire, unpack old value in place,
    * rebuild merged into scratch, normalize, resize + copy, release */
   KeyCtx & kc = *this->kctx;
-  this->key_of( e )->set( kc );
+  this->set_key( e, kc );
   this->wrk.reset();
   KeyStatus status = kc.acquire( &this->wrk );
   if ( status > KEY_IS_NEW )
@@ -223,8 +226,9 @@ CacheTab::shm_merge( CacheEntry &e,  const void *upd,  size_t upd_len,
   uint32_t out_enc = 0;
   if ( status == KEY_OK && kc.value( &p, oldsz ) == KEY_OK && oldsz > 0 ) {
     /* the HashEntry type byte is the msg_enc hint: unpack always
-     * produces a message of the codec the byte declares */
-    out = this->build_merge( p, oldsz, kc.get_type(),
+     * produces a message of the codec the byte declares; build_merge
+     * dispatches on the full id (RWF_MAP_TYPE_ID -> key merge) */
+    out = this->build_merge( p, oldsz, enc_of_type_byte( kc.get_type() ),
                              upd, upd_len, upd_enc, out_enc );
   }
   const void * res;
@@ -262,7 +266,7 @@ CacheTab::shm_get( CacheEntry &e,  void *&bytes,  size_t &len,
                    uint32_t &enc ) noexcept
 {
   KeyCtx & kc = *this->kctx;
-  this->key_of( e )->set( kc );
+  this->set_key( e, kc );
   this->wrk.reset();
   if ( kc.find( &this->wrk ) != KEY_OK )
     return false;
@@ -292,7 +296,7 @@ void
 CacheTab::shm_evict( CacheEntry &e ) noexcept
 {
   KeyCtx & kc = *this->kctx;
-  this->key_of( e )->set( kc );
+  this->set_key( e, kc );
   this->wrk.reset();
   KeyStatus status = kc.acquire( &this->wrk );
   if ( status <= KEY_IS_NEW ) {
@@ -327,6 +331,12 @@ CacheTab::set_image( CacheEntry &e,  const void *bytes,  size_t len,
                      uint32_t enc ) noexcept
 {
   this->normalize_msg_type( bytes, len, enc );
+  /* a replaced image: any Map index / tombstone accounting is stale */
+  e.image_serial++;
+  e.dead_bytes_hint = 0;
+  e.tail_slack = 0;
+  if ( e.midx != NULL )
+    e.midx->valid = false;
   if ( this->shm_mode() ) {
     this->shm_set( e, bytes, len, enc );
     return;
@@ -352,6 +362,11 @@ CacheTab::build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
                        const void *upd,  size_t upd_len,
                        uint32_t upd_enc,  uint32_t &out_enc ) noexcept
 {
+  /* RWF Map images (book domains) merge by entry key, not by field */
+  if ( old_enc == RWF_MAP_TYPE_ID && upd_enc == RWF_MAP_TYPE_ID ) {
+    out_enc = RWF_MAP_TYPE_ID;
+    return this->build_merge_map( oldb, old_len, upd, upd_len );
+  }
   MDMsgMem mem;
   MDMsg * oldm = MDMsg::unpack( (void *) oldb, 0, old_len, old_enc,
                                 this->dict.dict, mem );
@@ -413,6 +428,382 @@ CacheTab::build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
   return out_len;
 }
 
+/* ---- RWF Map merge (phase 1: rebuild; the same byte-level pass is the
+ * compaction step of the in-place layout) ---- */
+
+size_t
+CacheTab::merge_field_lists( MDMsgMem &mem,  const void *oldb,
+                             size_t old_len,  const void *upd,
+                             size_t upd_len,  void *&out ) noexcept
+{
+  RwfMsg * om = RwfMsg::unpack_field_list( (void *) oldb, 0, old_len,
+                                RWF_FIELD_LIST_TYPE_ID, this->dict.dict, mem ),
+         * um = RwfMsg::unpack_field_list( (void *) upd, 0, upd_len,
+                                RWF_FIELD_LIST_TYPE_ID, this->dict.dict, mem );
+  if ( om == NULL || um == NULL )
+    return 0;
+  MDFieldIter * oit = NULL, * nit = NULL;
+  if ( om->get_field_iter( oit ) != 0 || um->get_field_iter( nit ) != 0 )
+    return 0;
+  size_t cap = old_len + upd_len + 256;
+  out = mem.make( cap );
+  RwfFieldListWriter w( mem, this->dict.dict, out, cap );
+  /* pass 1: old order, values from the update where present */
+  if ( oit->first() == 0 ) {
+    do {
+      MDName nm;
+      MDReference mref;
+      if ( oit->get_name( nm ) != 0 )
+        continue;
+      if ( nit->find( nm, mref ) == 0 )
+        w.append_iter( nit );
+      else
+        w.append_iter( oit );
+    } while ( oit->next() == 0 );
+  }
+  /* pass 2: fields only in the update */
+  if ( nit->first() == 0 ) {
+    do {
+      MDName nm;
+      MDReference tmp;
+      if ( nit->get_name( nm ) != 0 )
+        continue;
+      if ( oit->find( nm, tmp ) != 0 )
+        w.append_iter( nit );
+    } while ( nit->next() == 0 );
+  }
+  size_t len = w.update_hdr();
+  if ( w.err != 0 )
+    return 0;
+  out = w.buf; /* may have moved on resize */
+  return len;
+}
+
+namespace {
+/* one entry of the update, indexed for the merge pass */
+struct UpdEntry {
+  const uint8_t * key;      /* encoded key bytes */
+  size_t          key_len,
+                  ent_start, /* whole entry: action byte .. data end */
+                  ent_end,
+                  data_start,/* field list bytes */
+                  data_end;
+  RwfMapAction    action;
+  bool            used,
+                  set_data;  /* field list uses set-defined data */
+  bool same_key( const uint8_t *k,  size_t l ) const {
+    return l == this->key_len && ::memcmp( k, this->key, l ) == 0;
+  }
+};
+/* bounded byte appender over scratch */
+struct MapOut {
+  uint8_t * buf;
+  size_t    off, cap;
+  bool      ok;
+  MapOut( void *b,  size_t c ) : buf( (uint8_t *) b ), off( 0 ), cap( c ),
+                                  ok( true ) {}
+  bool room( size_t n ) { if ( this->off + n > this->cap ) this->ok = false;
+                          return this->ok; }
+  void u8( uint8_t x ) { if ( this->room( 1 ) ) this->buf[ this->off++ ] = x; }
+  void u16( uint16_t x ) { if ( this->room( 2 ) ) {
+    this->buf[ this->off++ ] = (uint8_t) ( x >> 8 );
+    this->buf[ this->off++ ] = (uint8_t) x; } }
+  void u15( size_t x ) { /* RWF u15: < 0x80 one byte, else 0x8000 | x */
+    if ( x < 0x80 ) this->u8( (uint8_t) x );
+    else this->u16( (uint16_t) ( 0x8000 | x ) ); }
+  void fe( size_t x ) { /* RWF fe prefix: < 0xfe one byte, else fe + u16 */
+    if ( x < 0xfe ) this->u8( (uint8_t) x );
+    else { this->u8( 0xfe ); this->u16( (uint16_t) x ); } }
+  void b( const void *p,  size_t n ) { if ( this->room( n ) ) {
+    ::memcpy( &this->buf[ this->off ], p, n ); this->off += n; } }
+};
+static inline bool
+fl_has_set_data( const uint8_t *data,  size_t len )
+{
+  return len > 0 && ( data[ 0 ] & RwfFieldListHdr::HAS_SET_DATA ) != 0;
+}
+}
+
+size_t
+CacheTab::build_merge_map( const void *oldb,  size_t old_len,
+                           const void *upd,  size_t upd_len ) noexcept
+{
+  MDMsgMem mem;
+  RwfMsg * om = RwfMsg::unpack_map( (void *) oldb, 0, old_len,
+                                    RWF_MAP_TYPE_ID, this->dict.dict, mem ),
+         * um = RwfMsg::unpack_map( (void *) upd, 0, upd_len,
+                                    RWF_MAP_TYPE_ID, this->dict.dict, mem );
+  if ( om == NULL || um == NULL )
+    return 0;
+  RwfMapHdr & oh = om->map,
+            & uh = um->map;
+  if ( oh.key_type != uh.key_type )
+    return 0;
+  uint8_t container = oh.container_type;
+  if ( container == RWF_NO_DATA )
+    container = uh.container_type;
+  if ( container != RWF_FIELD_LIST && container != RWF_NO_DATA )
+    return 0; /* book domains are Map<key, FieldList> */
+
+  const uint8_t * ob = (const uint8_t *) oldb,
+                * ub = (const uint8_t *) upd;
+
+  /* index the update's entries */
+  UpdEntry * ue   = (UpdEntry *) mem.make( sizeof( UpdEntry ) *
+                                           ( uh.entry_cnt + 1 ) );
+  uint32_t   ucnt = 0;
+  size_t     usum_start = 0, usum_len = 0;
+  MDFieldIter * uit = NULL;
+  if ( um->get_field_iter( uit ) == 0 && uit->first() == 0 ) {
+    RwfFieldIter & it = *(RwfFieldIter *) uit;
+    do {
+      if ( it.u.map.action == MAP_SUMMARY ) {
+        usum_start = it.field_start;
+        usum_len   = it.field_end - it.field_start;
+        continue;
+      }
+      if ( ucnt >= uh.entry_cnt )
+        break;
+      UpdEntry & u = ue[ ucnt++ ];
+      u.key        = (const uint8_t *) it.u.map.key;
+      u.key_len    = it.u.map.keylen;
+      u.ent_start  = it.field_start;
+      u.ent_end    = it.field_end;
+      u.data_start = it.data_start;
+      u.data_end   = it.field_end;
+      u.action     = it.u.map.action;
+      u.used       = false;
+      u.set_data   = fl_has_set_data( &ub[ u.data_start ],
+                                      u.data_end - u.data_start );
+    } while ( uit->next() == 0 );
+  }
+
+  /* worst case: everything from both sides + merged summary + header */
+  this->ensure_scratch( old_len + upd_len + oh.summary_size + usum_len + 64 );
+  MapOut o( this->scratch, this->scratch_len );
+
+  /* header: old's shape; summary if either side has one */
+  uint8_t flags = oh.flags & ~(uint8_t) RwfMapHdr::HAS_SUMMARY_DATA;
+  if ( oh.summary_size != 0 || usum_len != 0 )
+    flags |= RwfMapHdr::HAS_SUMMARY_DATA;
+  if ( ( uh.flags & RwfMapHdr::HAS_PERM_DATA ) != 0 )
+    flags |= RwfMapHdr::HAS_PERM_DATA;
+  o.u8( flags );
+  o.u8( oh.key_type );
+  o.u8( (uint8_t) ( container - RWF_CONTAINER_BASE ) );
+  if ( ( flags & RwfMapHdr::HAS_KEY_FID ) != 0 )
+    o.u16( (uint16_t) oh.key_fid );
+  if ( ( flags & RwfMapHdr::HAS_SET_DEFS ) != 0 ) {
+    o.u15( oh.set_size );
+    o.b( &ob[ oh.set_start ], oh.set_size );
+  }
+  if ( ( flags & RwfMapHdr::HAS_SUMMARY_DATA ) != 0 ) {
+    if ( oh.summary_size != 0 && usum_len != 0 ) {
+      void * sm = NULL;
+      size_t sl = this->merge_field_lists( mem, &ob[ oh.summary_start ],
+                                           oh.summary_size, &ub[ usum_start ],
+                                           usum_len, sm );
+      if ( sl == 0 )
+        return 0;
+      o.u15( sl );
+      o.b( sm, sl );
+    }
+    else if ( oh.summary_size != 0 ) {
+      o.u15( oh.summary_size );
+      o.b( &ob[ oh.summary_start ], oh.summary_size );
+    }
+    else {
+      o.u15( usum_len );
+      o.b( &ub[ usum_start ], usum_len );
+    }
+  }
+  size_t hint_off = o.off;
+  if ( ( flags & RwfMapHdr::HAS_COUNT_HINT ) != 0 )
+    o.u16( 0 ), o.u16( 0 );        /* u30 4-byte form, patched below */
+  size_t cnt_off = o.off;
+  o.u16( 0 );                       /* entry count, patched below */
+  uint32_t live = 0;
+
+  /* an entry as it lands in the image: always ADD, optional perm, key,
+   * field list (raw or re-encoded) */
+  struct Emit {
+    static void entry( MapOut &o,  const uint8_t *perm,  size_t perm_len,
+                       const uint8_t *key,  size_t key_len,
+                       const void *data,  size_t data_len,  bool no_data ) {
+      o.u8( (uint8_t) ( ( perm_len != 0 ? 0x10 : 0 ) | MAP_ADD_ENTRY ) );
+      if ( perm_len != 0 ) {
+        o.u15( perm_len );
+        o.b( perm, perm_len );
+      }
+      o.u15( key_len );
+      o.b( key, key_len );
+      if ( ! no_data ) {
+        o.fe( data_len );
+        o.b( data, data_len );
+      }
+    }
+  };
+  bool no_data = ( container == RWF_NO_DATA );
+
+  /* pass 1: old entries, with the update's actions on the same key
+   * applied in order (UPDATE merges, ADD replaces, DELETE drops) */
+  MDFieldIter * oit = NULL;
+  if ( om->get_field_iter( oit ) == 0 && oit->first() == 0 ) {
+    RwfFieldIter & it = *(RwfFieldIter *) oit;
+    do {
+      if ( it.u.map.action == MAP_SUMMARY )
+        continue;
+      const uint8_t * key     = (const uint8_t *) it.u.map.key;
+      size_t          key_len = it.u.map.keylen;
+      const uint8_t * perm    = (const uint8_t *) it.u.map.perm.buf;
+      size_t          perm_len = it.u.map.perm.len;
+      const void    * data    = &ob[ it.data_start ];
+      size_t          data_len = it.field_end - it.data_start;
+      bool            touched = false, alive = true, raw = true;
+      for ( uint32_t i = 0; i < ucnt; i++ ) {
+        UpdEntry & u = ue[ i ];
+        if ( u.used || ! u.same_key( key, key_len ) )
+          continue;
+        u.used  = true;
+        touched = true;
+        switch ( u.action ) {
+          case MAP_DELETE_ENTRY:
+            alive = false;
+            break;
+          case MAP_ADD_ENTRY:
+            alive    = true;
+            data     = &ub[ u.data_start ];
+            data_len = u.data_end - u.data_start;
+            raw      = ! u.set_data; /* the update's set defs are not ours */
+            break;
+          case MAP_UPDATE_ENTRY:
+          default:
+            if ( ! alive ) { /* delete then update: treat as add */
+              alive    = true;
+              data     = &ub[ u.data_start ];
+              data_len = u.data_end - u.data_start;
+              raw      = ! u.set_data;
+            }
+            else if ( ! no_data ) {
+              void * m = NULL;
+              size_t ml = this->merge_field_lists( mem, data, data_len,
+                                                   &ub[ u.data_start ],
+                                                   u.data_end - u.data_start,
+                                                   m );
+              if ( ml == 0 )
+                return 0;
+              data     = m;
+              data_len = ml;
+              raw      = true; /* merged output is standard data */
+            }
+            break;
+        }
+      }
+      if ( ! alive )
+        continue;
+      if ( ! touched ) { /* verbatim, including a perm blob */
+        o.b( &ob[ it.field_start ], it.field_end - it.field_start );
+        live++;
+        continue;
+      }
+      if ( ! raw ) { /* re-encode set-defined data from the update */
+        RwfMsg * fm = um->unpack_sub_msg( RWF_FIELD_LIST,
+                                          (const uint8_t *) data - ub,
+                                          (const uint8_t *) data - ub +
+                                          data_len );
+        MDFieldIter * fi = NULL;
+        if ( fm == NULL || fm->get_field_iter( fi ) != 0 )
+          return 0;
+        size_t cap = data_len * 2 + 256;
+        void * nb  = mem.make( cap );
+        RwfFieldListWriter w( mem, this->dict.dict, nb, cap );
+        if ( fi->first() == 0 )
+          do { w.append_iter( fi ); } while ( fi->next() == 0 );
+        data_len = w.update_hdr();
+        if ( w.err != 0 )
+          return 0;
+        data = w.buf;
+      }
+      Emit::entry( o, perm, perm_len, key, key_len, data, data_len, no_data );
+      live++;
+    } while ( oit->next() == 0 );
+  }
+  /* pass 2: keys new to the image (ADD, or UPDATE of an unknown key) */
+  for ( uint32_t i = 0; i < ucnt; i++ ) {
+    UpdEntry & u = ue[ i ];
+    if ( u.used || u.action == MAP_DELETE_ENTRY )
+      continue;
+    u.used = true;
+    /* a later action on the same new key in the same message */
+    const void * data    = &ub[ u.data_start ];
+    size_t       data_len = u.data_end - u.data_start;
+    bool         alive   = true, raw = ! u.set_data;
+    for ( uint32_t j = i + 1; j < ucnt; j++ ) {
+      UpdEntry & v = ue[ j ];
+      if ( v.used || ! v.same_key( u.key, u.key_len ) )
+        continue;
+      v.used = true;
+      if ( v.action == MAP_DELETE_ENTRY )
+        alive = false;
+      else if ( v.action == MAP_ADD_ENTRY || ! alive ) {
+        alive = true; data = &ub[ v.data_start ];
+        data_len = v.data_end - v.data_start; raw = ! v.set_data;
+      }
+      else if ( ! no_data ) {
+        void * m = NULL;
+        size_t ml = this->merge_field_lists( mem, data, data_len,
+                                             &ub[ v.data_start ],
+                                             v.data_end - v.data_start, m );
+        if ( ml == 0 )
+          return 0;
+        data = m; data_len = ml; raw = true;
+      }
+    }
+    if ( ! alive )
+      continue;
+    if ( ! raw ) {
+      RwfMsg * fm = um->unpack_sub_msg( RWF_FIELD_LIST,
+                                        (const uint8_t *) data - ub,
+                                        (const uint8_t *) data - ub + data_len );
+      MDFieldIter * fi = NULL;
+      if ( fm == NULL || fm->get_field_iter( fi ) != 0 )
+        return 0;
+      size_t cap = data_len * 2 + 256;
+      void * nb  = mem.make( cap );
+      RwfFieldListWriter w( mem, this->dict.dict, nb, cap );
+      if ( fi->first() == 0 )
+        do { w.append_iter( fi ); } while ( fi->next() == 0 );
+      data_len = w.update_hdr();
+      if ( w.err != 0 )
+        return 0;
+      data = w.buf;
+    }
+    /* perm data of a new entry comes from the update entry itself */
+    const uint8_t * perm = NULL;
+    size_t perm_len = 0;
+    if ( ( uh.flags & RwfMapHdr::HAS_PERM_DATA ) != 0 &&
+         ( ub[ u.ent_start ] & 0x10 ) != 0 ) {
+      size_t sz = get_u15_prefix( &ub[ u.ent_start + 1 ], &ub[ upd_len ],
+                                  perm_len );
+      perm = &ub[ u.ent_start + 1 + sz ];
+    }
+    Emit::entry( o, perm, perm_len, u.key, u.key_len, data, data_len, no_data );
+    live++;
+  }
+  if ( ! o.ok || live > 0xffff )
+    return 0;
+  if ( ( flags & RwfMapHdr::HAS_COUNT_HINT ) != 0 ) {
+    uint32_t h = live | 0xc0000000U;
+    o.buf[ hint_off ]     = (uint8_t) ( h >> 24 );
+    o.buf[ hint_off + 1 ] = (uint8_t) ( h >> 16 );
+    o.buf[ hint_off + 2 ] = (uint8_t) ( h >> 8 );
+    o.buf[ hint_off + 3 ] = (uint8_t) h;
+  }
+  o.buf[ cnt_off ]     = (uint8_t) ( live >> 8 );
+  o.buf[ cnt_off + 1 ] = (uint8_t) live;
+  return o.off;
+}
+
 /* field-merge: rebuild image from old image, overwriting fields present in
  * the update and appending fields only in the update.  shm mode does the
  * read-modify-write under a single entry lock (shm_merge); heap mode
@@ -420,6 +811,29 @@ CacheTab::build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
 size_t
 CacheTab::merge( CacheEntry &e,  const void *upd,  size_t upd_len,
                  uint32_t upd_enc ) noexcept
+{
+  if ( upd_enc == RWF_MAP_TYPE_ID ) {
+    /* timed: the Milestone 5 comparison (rebuild / scan / index) */
+    uint64_t t0 = kv::current_monotonic_time_ns();
+    size_t   n  = 0;
+    if ( this->map_inplace )
+      n = this->merge_map_inplace( e, upd, upd_len );
+    if ( n == 0 ) {
+      this->stats_rebuild++; /* not applicable (summary, no image) */
+      if ( this->shm_mode() )
+        n = this->shm_merge( e, upd, upd_len, upd_enc );
+      else
+        n = this->merge_heap( e, upd, upd_len, upd_enc );
+    }
+    this->stats_map_ns += kv::current_monotonic_time_ns() - t0;
+    return n;
+  }
+  return this->merge_heap( e, upd, upd_len, upd_enc );
+}
+
+size_t
+CacheTab::merge_heap( CacheEntry &e,  const void *upd,  size_t upd_len,
+                      uint32_t upd_enc ) noexcept
 {
   if ( this->shm_mode() )
     return this->shm_merge( e, upd, upd_len, upd_enc );
@@ -449,6 +863,7 @@ CacheTab::evict( const char *subj,  size_t len ) noexcept
   if ( e != NULL ) {
     if ( this->shm_mode() )
       this->shm_evict( *e );
+    e->release_index();
     if ( e->image != NULL ) {
       this->image_bytes -= e->image_len;
       ::free( e->image );

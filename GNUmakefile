@@ -264,7 +264,7 @@ all_dlls    :=
 all_depends :=
 gen_files   :=
 
-rv_cache_files := rv_cache sass2 sass3 omm cache_tab config
+rv_cache_files := rv_cache sass2 sass3 omm cache_tab map_merge config
 rv_cache_cfile := $(addprefix src/, $(addsuffix .cpp, $(rv_cache_files)))
 rv_cache_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(rv_cache_files)))
 rv_cache_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(rv_cache_files)))
@@ -275,6 +275,20 @@ $(bind)/rv_cache$(exe): $(rv_cache_objs) $(rv_cache_libs) $(lnk_dep)
 
 all_exes    += $(bind)/rv_cache$(exe)
 all_depends += $(rv_cache_deps)
+
+# test/map_bench: CacheTab::merge on RWF Map images with hw counters
+map_bench_files := map_bench cache_tab map_merge
+map_bench_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(map_bench_files))) $(omm_home)/$(build_dir)/obj/book_pub.o
+map_bench_deps  := $(addprefix $(dependd)/, $(addsuffix .d, map_bench cache_tab map_merge))
+map_bench_libs  :=
+map_bench_lnk   := $(lnk_lib)
+
+$(bind)/map_bench$(exe): $(map_bench_objs) $(map_bench_libs) $(lnk_dep)
+
+ifneq (true,$(mingw))  # perf_event_open: linux only
+all_exes    += $(bind)/map_bench$(exe)
+all_depends += $(map_bench_deps)
+endif
 
 all_dirs := $(bind) $(libd) $(objd) $(dependd)
 

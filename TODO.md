@@ -160,8 +160,87 @@ scoped by the per-net wildcard.)*
       omm feed (currently fail-fast); `send_snapshot()` for _SNAP
       without interest + pending-inbox replies (InboxReplyTab pattern);
       service-health directory updates (OmmSourceDB listener); field-
-      list-native caching for omm-fed subjects; multi-part REFRESH
-      accumulation (currently each part replaces).
+      list-native caching for omm-fed MARKET_PRICE subjects (Map domains
+      are RWF-native already, see Milestone 5).
+- [x] (2026-09-22) **Milestone 5 phase 1 — RWF Map caching (book
+      domains).** `handle_rwf_map`: Map payloads cached as
+      `RWF_MAP_TYPE_ID`, `CacheTab::build_merge_map` rebuilds by entry
+      key (ADD replace / UPDATE fid-merge / DELETE / summary merge / set
+      defs kept, set-encoded update entries re-encoded), multipart
+      refresh via `image_partial`, raw forward of the feed envelope with
+      SOLICITED cleared, solicited serve via `add_raw_container`.  raimd:
+      `MAP_ENTRY_DEAD` iterator skip + ETA-correct perm gate,
+      `RwfFieldListWriter::append_iter`.  Verified against a book rebuilt
+      from the feed stream (`/tmp/bookcheck.py` style) and ETA Consumer.
+- [x] (2026-09-23) **Milestone 5 phase 2 — in-place Map merge**
+      (`src/map_merge.cpp`).  Tombstones (`MAP_ENTRY_DEAD`, live count in
+      the header), UPDATE refit in place (key-prefix widening for 1 byte
+      of slack, dead DELETE filler for 2+), tombstone + append on growth,
+      compaction when dead > live and > 1 KB, writer-side `MapIndex`
+      per `CacheEntry` (key hash → offset, validated by
+      `CacheEntry::image_serial` = `KeyCtx::serial` in shm mode, rebuilt
+      by prefix scan), serve strips (`live_image`).  Config `map_merge:
+      inplace|rebuild`, `map_index_min` (1 = always index, 0 = scan).
+      Merge time per update, `/tmp/mapbench.sh`, 50 ticks/s, 20 s each,
+      all runs book-checked MATCH:
+
+        keys / image     rebuild   inplace+scan   inplace+index
+           4 /  250 B      5.3 us      5.8 us         3.5 us
+           8 /  440 B      4.2        4.0            3.8
+          62 /    3 KB      6.8        5.8            3.8
+         399 /   20 KB     16.5       10.2            4.1
+        2400 /  119 KB     75.6       31.7            4.2
+        8400 /  418 KB    256.0      164.5            4.3
+
+      The index is flat: ~4 us is the fixed cost (unpack the update,
+      fid-merge one field list through the dictionary, encode, memcpy).
+      There is no book size where it loses — below ~10 keys the three
+      are within noise — so the default indexes every book (128 B min).
+- [x] (2026-09-23) **shm mode exercised** (`map_name: sysv:rvbook.shm`,
+      512 MB test map via `kv_server -m sysv:rvbook.shm -s 512`, removed
+      with `-r` after): in-place+index 3.9 µs (399 keys) / 6.9 µs (8.4k
+      keys, 418 KB), compactions on small books, rebuild mode — all
+      MATCH.  Two bugs found: `shm_merge` handed `build_merge` the
+      HashEntry type *byte*, so the Map dispatch never fired in shm
+      (fixed: `enc_of_type_byte`); the index serial must be read right
+      after `acquire()` (the sealed value) and before `value_update()`
+      bumps it, else every merge rebuilt the index.  Cross-process serve
+      verified: a second rv_cache (provider only, same map, no feed, no
+      index) served the writer's book stripped of tombstones — matched
+      the writer's client at the same seq (236 keys); `live_image` now
+      strips unless THIS process's index is current and reports zero
+      dead bytes, and takes the enc from `get_image` (a reader's
+      `CacheEntry.image_enc` is 0).
+- [x] (2026-09-23) **`test/map_bench`** — `CacheTab::merge` in a loop on a
+      BookRoute-generated refresh + N deterministic updates, no network,
+      hardware counters (perf_event_open) around the loop.  The live
+      rv_cache numbers (3-4 µs) were 10× the isolated cost: a merge right
+      after epoll wake-up runs cold (C-state, caches), and whole-process
+      `perf stat` is swamped by the poll loop.  Per merge, 398-key book,
+      pinned:  in-place+index **6.2k instr / 1.4k cycles / 0.25 µs**,
+      in-place+scan 59k / 12.6k, rebuild 223k / 37k / 7 µs.  shm adds
+      ~550 instructions (acquire / value_update / release).  The rest of
+      the shm gap was `resize(copy)` copying the image on growth (4,120
+      L1 misses per merge on a 600 KB book): fixed with **tail slack** —
+      appends land in a trailing dead DELETE filler (a valid tombstone,
+      1/8 of the image, 1 KB..32 KB, `map_grow_len`), so growth copies
+      once per slack refill.  After: 600 KB book shm 3.3k cycles / 80 L1
+      misses vs heap 1.8k / 25; 20 KB book 1.5k vs 1.4k cycles.
+- [x] (2026-09-23) **shm key path slimmed** (Chris): per-op `EvKeyCtx`
+      (128-bit rehash + placement of a full EvKeyCtx) replaced by
+      `CacheTab::set_key`: the NUL-terminated subject is copied into a
+      small `keybuf` KeyFragment (keylen = len + 1, the EvKeyCtx / raids
+      string-key convention kept on purpose — the format is unchanged)
+      and the hash is cached in `CacheEntry::khash1/2`.  shm overhead per
+      merge went from ~550 to **~175 instructions / ~90 cycles** (398-key
+      book: 6,387 vs 6,211 instr, 1,491 vs 1,399 cyc).  (A zero-copy
+      variant reinterpreting the RouteVec trailer as the KeyFragment was
+      tried and reverted: it drops the NUL.)
+- [ ] Milestone 5 leftovers: `image_partial` lives in the heap entry only
+      (a reader process could serve a half-received multipart book);
+      an update carrying summary data takes the rebuild path (header
+      rewrite); per-book index memory is unbounded by config (8 B/slot,
+      2× live keys).
 - [ ] **Milestone 4 client side** (SPEC §"Client side: EvOmmListen net",
       2026-07-31, full spec): `-<idx> sub omm <listen> <service>` —
       EvOmmConn inherits stream tables / solicited gating / stream_id

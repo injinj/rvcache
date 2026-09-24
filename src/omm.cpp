@@ -57,10 +57,138 @@ RvCache::omm_wild_match( uint32_t net,  const char *subj,
   return len == n && ::memcmp( subj, w, n ) == 0;
 }
 
+uint8_t
+RvCache::rwf_domain_of( const char *subj,  size_t len ) noexcept
+{
+  size_t i = 0;
+  while ( i < len && subj[ i ] != '.' ) i++;
+  if ( i < len ) {
+    size_t j = ++i;
+    while ( j < len && subj[ j ] != '.' ) j++;
+    if ( j < len ) {
+      size_t n = j - i;
+      for ( uint8_t d = MARKET_PRICE_DOMAIN; d < RDM_DOMAIN_COUNT; d++ ) {
+        const char * sect = rdm_sector_str[ d ];
+        if ( sect != NULL && rdm_sector_strlen( sect ) == n &&
+             ::memcmp( sect, &subj[ i ], n ) == 0 )
+          return d;
+      }
+    }
+  }
+  return MARKET_PRICE_DOMAIN;
+}
+
+/* Map payload (book domains): cache the RWF Map natively.  REFRESH with
+ * CLEAR_CACHE starts the image, further parts / UPDATEs key-merge into it
+ * (CacheTab::build_merge_map), REFRESH_COMPLETE makes it servable.  An
+ * UPDATE with no image cannot make one (a partial book is not an image):
+ * forwarded, not cached, interest stays pending until a refresh. */
+void
+RvCache::handle_rwf_map( uint32_t net,  const char *subj,  size_t len,
+                         RwfMsg &m ) noexcept
+{
+  const uint8_t * payload = (const uint8_t *) m.msg_buf + m.msg.data_start;
+  size_t          plen    = m.msg.data_end - m.msg.data_start;
+  bool            has_seq = m.msg.test( X_HAS_SEQ_NUM );
+  uint32_t        seq_num = (uint32_t) ( has_seq ? m.msg.seq_num : 0 );
+
+  this->stats.msgs_recv++;
+  this->stats.bytes_recv += len + ( m.msg_end - m.msg_off );
+
+  if ( m.msg.msg_class == STATUS_MSG_CLASS ) {
+    bool closed = m.msg.test( X_HAS_STATE ) &&
+                  m.msg.state.stream_state != STREAM_STATE_OPEN;
+    if ( closed ) {
+      if ( this->cache.find( subj, len ) != NULL ) {
+        this->cache.evict( subj, len );
+        this->stats.msgs_evicted++;
+      }
+    }
+    else
+      this->stats.msgs_transient_fwd++;
+  }
+  else if ( m.msg.msg_class == REFRESH_MSG_CLASS ||
+            m.msg.msg_class == UPDATE_MSG_CLASS ) {
+    bool is_refresh = ( m.msg.msg_class == REFRESH_MSG_CLASS ),
+         is_new     = false;
+    CacheEntry * ce = this->cache.upsert( subj, len, is_new );
+    if ( ce != NULL ) {
+      bool has_image = ( ! is_new && ce->image_len != 0 );
+      this->cache.prefetch( *ce, true ); /* shm: the entry line, early */
+      ce->update_count++;
+      ce->last_update_ns = this->now_ns();
+      if ( has_seq ) { ce->last_seqno = seq_num; ce->has_seqno = true; }
+      if ( is_refresh ) {
+        ce->msg_type = MD_INITIAL_TYPE;
+        if ( m.msg.test( X_CLEAR_CACHE ) || ! has_image ) {
+          this->cache.set_image( *ce, payload, plen, RWF_MAP_TYPE_ID );
+          ce->image_partial = true;
+        }
+        else
+          this->cache.merge( *ce, payload, plen, RWF_MAP_TYPE_ID );
+        if ( m.msg.test( X_REFRESH_COMPLETE ) )
+          ce->image_partial = false;
+      }
+      else if ( has_image ) {
+        ce->msg_type = MD_UPDATE_TYPE;
+        this->cache.merge( *ce, payload, plen, RWF_MAP_TYPE_ID );
+      }
+      if ( this->cfg.sequence_policy == SEQ_STAMP ) {
+        ce->own_seqno++;
+        ce->last_seqno = ce->own_seqno;
+      }
+    }
+  }
+  else
+    return;
+
+  /* forward to the omm provider nets only: rv nets have no Map form */
+  CacheEntry * fe   = this->cache.find( subj, len );
+  uint64_t     mask = ( fe != NULL ? fe->fwd_mask : 0 );
+  if ( ( mask & this->omm_subs ) != 0 ) {
+    this->omm_forward_raw( subj, len, m );
+    this->stats.msgs_forwarded++;
+    fe->forward_count++;
+  }
+  else if ( mask == 0 )
+    this->stats.msgs_no_listener++;
+  (void) net;
+}
+
+/* the feed's envelope re-published as-is: EvOmmConn stamps each client's
+ * stream id; SOLICITED comes off (it answered OUR request) so the
+ * provider fans it to every stream on the subject */
+void
+RvCache::omm_forward_raw( const char *subj,  size_t len,  RwfMsg &m ) noexcept
+{
+  if ( this->omm_listener == NULL )
+    return;
+  size_t    mlen = m.msg_end - m.msg_off;
+  MDMsgMem  mem;  /* a deep book's refresh part outgrows pubbuf */
+  uint8_t * buf  = ( mlen <= sizeof( this->pubbuf ) ) ?
+                   (uint8_t *) this->pubbuf : (uint8_t *) mem.make( mlen );
+  ::memcpy( buf, (const uint8_t *) m.msg_buf + m.msg_off, mlen );
+  if ( m.msg.msg_class == REFRESH_MSG_CLASS && mlen > 9 ) {
+    if ( buf[ 8 ] < 0x80 )               /* one byte u15 flags */
+      buf[ 8 ] &= (uint8_t) ~RWF_REFRESH_SOLICITED;
+    else                                 /* 0x8000 | flags */
+      buf[ 9 ] &= (uint8_t) ~RWF_REFRESH_SOLICITED;
+  }
+  uint32_t  h = kv_crc_c( subj, len, 0 );
+  EvPublish pub( subj, len, NULL, 0, buf, mlen,
+                 this->poll.sub_route, *this->omm_listener, h,
+                 RWF_MSG_TYPE_ID );
+  this->poll.sub_route.forward_msg( pub, NULL );
+}
+
 bool
 RvCache::on_omm_feed_msg( uint32_t net,  const char *subj,  size_t len,
                           RwfMsg &m ) noexcept
 {
+  if ( m.msg.container_type == RWF_MAP ) {
+    this->handle_rwf_map( net, subj, len, m );
+    return true;
+  }
   bool     has_seq    = m.msg.test( X_HAS_SEQ_NUM );
   uint32_t seq_num    = (uint32_t) ( has_seq ? m.msg.seq_num : 0 );
   RwfMsg * fields     = m.get_container_msg();
@@ -202,7 +330,11 @@ RvCache::omm_send_initial( const char *subj,  size_t len ) noexcept
   void   * img;
   size_t   img_len;
   uint32_t img_enc;
-  if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) ) {
+  if ( e != NULL )
+    this->cache.prefetch( *e, false );
+  if ( e != NULL && ! e->image_partial &&
+       this->cache.get_image( *e, img, img_len, img_enc ) &&
+       this->cache.live_image( *e, img, img_len, img_enc ) ) {
     this->omm_forward( subj, len, img, img_len, img_enc,
                        MD_INITIAL_TYPE, e->last_seqno, true );
     e->snap_count++;
@@ -248,7 +380,8 @@ RvCache::omm_pending_check( void ) noexcept
     bool done = false;
     CacheEntry * e = this->find_for_image( tmp, l );
     void * img; size_t img_len; uint32_t img_enc;
-    if ( e != NULL && this->cache.get_image( *e, img, img_len, img_enc ) )
+    if ( e != NULL && ! e->image_partial &&
+         this->cache.get_image( *e, img, img_len, img_enc ) )
       done = true;
     else if ( p->open_ns < cutoff ) {
       this->omm_send_status( tmp, l, true );
@@ -301,6 +434,43 @@ RvCache::omm_forward( const char *subj,  size_t len,  const void *msg,
     return;
   }
   MDMsgMem mem;
+  uint32_t h = kv_crc_c( subj, len, 0 );
+  if ( enc == RWF_MAP_TYPE_ID ) {
+    /* a cached book: solicited refresh around the Map bytes, domain from
+     * the subject's sector; updates never come this way (raw forward) */
+    size_t   sz = msg_len + 1024;
+    void   * bp = mem.make( sz );
+    RwfMsgWriter em( mem, this->cache.dict.rdm_dict, bp, sz,
+                     REFRESH_MSG_CLASS,
+                     (RdmDomainType) this->rwf_domain_of( subj, len ), h );
+    if ( solicited )
+      em.set( X_CLEAR_CACHE, X_SOLICITED, X_REFRESH_COMPLETE );
+    else
+      em.set( X_CLEAR_CACHE, X_REFRESH_COMPLETE );
+    uint8_t group_id[ 2 ] = { (uint8_t) ( this->cfg.omm_service_id >> 8 ),
+                              (uint8_t) this->cfg.omm_service_id };
+    em.add_seq_num( seqno )
+      .add_state( DATA_STATE_OK, STREAM_STATE_OPEN )
+      .add_group_id( group_id, sizeof( group_id ) )
+      .add_qos( QOS_TIME_REALTIME, QOS_RATE_TICK_BY_TICK, false )
+      .add_msg_key()
+        .service_id( this->cfg.omm_service_id )
+        .name( subj, len )
+        .name_type( NAME_TYPE_RIC )
+      .end_msg_key();
+    em.add_raw_container( RWF_MAP, msg, msg_len );
+    size_t off = em.end_msg();
+    if ( em.err != 0 ) {
+      fprintf( stderr, "omm fwd %.*s: map envelope failed (%d)\n",
+               (int) len, subj, em.err );
+      return;
+    }
+    EvPublish pub( subj, len, NULL, 0, em.buf, off,
+                   this->poll.sub_route, *this->omm_listener, h,
+                   RWF_MSG_TYPE_ID );
+    this->poll.sub_route.forward_msg( pub, NULL );
+    return;
+  }
   MDMsg * m = MDMsg::unpack( (void *) msg, 0, msg_len, enc,
                              this->cache.dict.dict, mem );
   if ( m == NULL )
@@ -308,7 +478,6 @@ RvCache::omm_forward( const char *subj,  size_t len,  const void *msg,
   bool is_refresh = ( msg_type == MD_INITIAL_TYPE ||
                       msg_type == MD_SNAPSHOT_TYPE ||
                       msg_type == MD_VERIFY_TYPE );
-  uint32_t h  = kv_crc_c( subj, len, 0 );
   size_t   sz = msg_len + 1024;
   void   * bp = mem.make( sz );
   RwfMsgWriter em( mem, this->cache.dict.rdm_dict, bp, sz,
@@ -373,7 +542,8 @@ RvCache::omm_send_status( const char *subj,  size_t len,
   void   * bp = mem.make( sz );
   uint32_t h  = kv_crc_c( subj, len, 0 );
   RwfMsgWriter em( mem, this->cache.dict.rdm_dict, bp, sz,
-                   STATUS_MSG_CLASS, MARKET_PRICE_DOMAIN, h );
+                   STATUS_MSG_CLASS,
+                   (RdmDomainType) this->rwf_domain_of( subj, len ), h );
   uint8_t group_id[ 2 ] = { (uint8_t) ( this->cfg.omm_service_id >> 8 ),
                             (uint8_t) this->cfg.omm_service_id };
   em.add_state( DATA_STATE_SUSPECT,
@@ -454,7 +624,9 @@ rvcache::announce_cache_service( OmmSourceDB &db,  MDDict *rdm_dict,
                         const char *svc,  uint32_t service_id ) noexcept
 {
   static const char * dict_nm[ 2 ] = { "RWFFld", "RWFEnum" };
-  static uint8_t cap[ 2 ] = { SOURCE_DOMAIN, MARKET_PRICE_DOMAIN };
+  /* book domains are served from the RWF Map cache (handle_rwf_map) */
+  static uint8_t cap[ 4 ] = { SOURCE_DOMAIN, MARKET_PRICE_DOMAIN,
+                              MARKET_BY_ORDER_DOMAIN, MARKET_BY_PRICE_DOMAIN };
   static RwfQos  qos      = { QOS_TIME_REALTIME, QOS_RATE_TICK_BY_TICK,
                               0, 0, 0 };
   char         buf[ 1024 ];
@@ -468,7 +640,7 @@ rvcache::announce_cache_service( OmmSourceDB &db,  MDDict *rdm_dict,
      .append_string( NAME        , svc )
      .append_string( VEND        , "rvcache" )
      .append_uint  ( IS_SRC      , 1 )
-     .append_array ( CAPAB       , cap , 2, MD_UINT )
+     .append_array ( CAPAB       , cap , 4, MD_UINT )
      .append_array ( DICT_PROV   , dict_nm, 2 )
      .append_array ( DICT_USED   , dict_nm, 2 )
      .append_array ( QOS         , &qos, 1 )

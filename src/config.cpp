@@ -238,6 +238,9 @@ load_config( const char *path,  Config &cfg ) noexcept
   if ( (s = json_str( o, "omm_token" )) != NULL )
     cfg.omm_token = s;
   json_uint( o, "omm_service_id", cfg.omm_service_id );
+  if ( (s = json_str( o, "map_merge" )) != NULL )
+    cfg.map_inplace = ( ::strcmp( s, "rebuild" ) != 0 );
+  json_uint( o, "map_index_min", cfg.map_index_min );
   if ( (s = json_str( o, "map_name" ))  != NULL )
     cfg.map_name = s;
   if ( (s = json_str( o, "dict_path" )) != NULL )

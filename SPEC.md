@@ -1311,6 +1311,72 @@ mirror RV→RWF, same writer dispatch).  New code: the RouteNotify glue,
 the sass→RWF converter, service-health wiring, and net-role plumbing in
 config.
 
+## Milestone 5 design — RWF Map caching for book domains (2026-09-22)
+
+MARKET_BY_ORDER (7) / MARKET_BY_PRICE (8) payloads are `Map<key,
+FieldList>`; there is no sass form, so these subjects are RWF-native
+end to end and rv nets never see them.
+
+**Ingest** (`RvCache::handle_rwf_map`, dispatched on
+`RwfMsgHdr.container_type == RWF_MAP`): the Map bytes (`msg +
+data_start`) are the cached element, type byte `(uint8_t)
+RWF_MAP_TYPE_ID`.  REFRESH with CLEAR_CACHE (or no image) replaces;
+further refresh parts and UPDATEs key-merge; `CacheEntry.image_partial`
+is set from CLEAR_CACHE until REFRESH_COMPLETE and gates serving (a
+partial book is a pending image).  An UPDATE with no image is forwarded,
+not cached.  STATUS closing evicts.
+
+**Merge semantics** (`CacheTab::build_merge_map`, reached through
+`build_merge` when both sides are `RWF_MAP_TYPE_ID`): entries keyed by
+their encoded key bytes (canonical for one key type).  ADD replaces the
+entry, UPDATE field-merges the entry's field list by fid (partial
+updates: ORDER_SIZE/QUOTIM_MS), DELETE removes; several actions on one
+key in one message apply in order.  Summary data field-merges.  The
+image keeps the refresh's local set definitions untouched; an update's
+own set-encoded entries are re-encoded as standard data (its defs are
+not ours), untouched entries are copied verbatim (perm blobs included).
+Image entries are always ADD.  Phase 1 rebuilds the whole map into
+scratch per update — O(book) — which is the oracle for phase 2.
+
+**Forward / serve**: updates and refresh parts go out as the feed's own
+envelope (`omm_forward_raw`), SOLICITED cleared so `EvOmmConn` fans it to
+every stream on the subject; rv nets are skipped.  A solicited initial
+wraps the cached Map with `RwfMsgWriter::add_raw_container` under a
+REFRESH whose domain comes from the subject's sector
+(`rwf_domain_of`: `<svc>.MBO.<ric>` → 7).  Statuses carry the same
+domain.  The provider directory advertises 7 and 8.
+
+**Phase 2 (2026-09-23, `map_merge.cpp`): in-place merge.**  Image stays a
+valid RWF Map plus tombstones: a spare entry-header flag (`MAP_ENTRY_DEAD` = 0x80;
+ETA decodes the other three flag bits and ignores them, raimd's map
+iterator skips dead entries), header count = live count, growth by
+tombstone + append, shrink absorbed by the variable-width length
+prefixes (`0xfe` form), compaction over a dead-bytes threshold.  The key
+→ offset index lives in the WRITER's process memory per `CacheEntry`,
+validated by `KeyCtx::serial` (bumped per acquire/release): equal →
+use, else rebuild by a prefix-only scan; offsets relative to the value
+start because `resize()` moves it.  Readers need no index (serve is the
+linear live-entry strip); the shm contract is unchanged.  Invariant: a
+raw image never reaches a wire consumer — serve always strips, since
+ETA would apply a dead entry as live (`rsslDecodeMapEntry`: action =
+low nibble, flags = high nibble, only HAS_PERM_DATA consulted and only
+when the map header also has per-entry perm data; DELETE carries no
+data by decoder rule).
+
+Implementation notes.  A merge is planned then committed: `plan_map_update`
+parses the update, validates/rebuilds the index, and for each entry
+decides DEAD / WRITE (refit in place, exact size via prefix widths or a
+dead DELETE filler `0x83 + key of garbage length`) / APPEND, with the
+field merges done into `MDMsgMem`; `commit_map_update` sizes the image
+once (heap `realloc`, shm `KeyCtx::resize(copy)`) and applies.  Chains on
+one key within a message are folded into the pending append.  Slots that
+point at dead entries accumulate; over 75 % occupancy the index is
+flagged for rebuild.  Compaction (`strip_map`, also the serve path) runs
+when dead bytes exceed live bytes and 1 KB.  Measured (TODO.md table):
+~4 µs per update independent of book size with the index, versus 256 µs
+rebuild / 165 µs scan on an 8.4k-order book; the index never loses, so
+`map_index_min` defaults to 1.
+
 ## Open questions — resolved
 
 1. **Forward lookup without entry creation** *(re-resolved — submgr owns

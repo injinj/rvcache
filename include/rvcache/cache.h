@@ -74,6 +74,8 @@ struct Config {
              * omm_instance_id,
              * omm_token;
   uint32_t     omm_service_id;       /* provider-side directory id (1) */
+  bool         map_inplace;          /* map_merge: inplace | rebuild */
+  uint32_t     map_index_min;        /* map_index_min: entries (1=always, 0=never) */
   SeqPolicy    sequence_policy;      /* -Q  */
   bool         replace_typeless_msgs, /* -r  replace (not merge) typeless */
                route_after_merge,    /* -M  */
@@ -84,6 +86,7 @@ struct Config {
              message_eviction_secs( 0 ), pending_initial_secs( 10 ),
              omm_user( 0 ), omm_app_id( 0 ), omm_app_name( 0 ),
              omm_instance_id( 0 ), omm_token( 0 ), omm_service_id( 1 ),
+             map_inplace( true ), map_index_min( 1 ),
              sequence_policy( SEQ_OBSERVE ), replace_typeless_msgs( false ),
              route_after_merge( false ), quiet( false ), verbose( false ) {}
 
@@ -135,6 +138,26 @@ struct Stats {
 };
 
 /* subject cache entry (raikv RouteVec Data: trailing hash/len/value[]) */
+/* writer-side key -> offset index over an RWF Map image (map_merge.cpp).
+ * Process memory only; shm mode validates it against KeyCtx::serial. */
+struct MapIndex {
+  struct Slot { uint32_t hash, off; }; /* off 0 = empty (0 is the header) */
+  uint64_t serial;        /* image serial the index was built/kept for */
+  Slot   * slots;
+  uint32_t mask, used,    /* slots in use, including dead-pointing ones */
+           live_cnt, dead_bytes,
+           tail_slack;     /* trailing filler seen by build() */
+  bool     valid;
+  MapIndex() : serial( 0 ), slots( 0 ), mask( 0 ), used( 0 ), live_cnt( 0 ),
+               dead_bytes( 0 ), tail_slack( 0 ), valid( false ) {}
+  void   release( void ) noexcept;
+  void   clear( uint32_t expect ) noexcept;
+  Slot * probe( uint32_t hash,  const uint8_t *img,  size_t len,
+                const uint8_t *key,  size_t key_len,  const void *shape,
+                void *raw_entry_out ) noexcept;
+  bool   build( const uint8_t *img,  size_t len ) noexcept;
+};
+
 struct CacheEntry {
   uint64_t fwd_mask;       /* per-net forwarding bools: bit (idx-1) set by
                             * a subscribe with refcnt > 0 on that net,
@@ -149,8 +172,18 @@ struct CacheEntry {
   uint32_t subject_id;
   uint32_t last_seqno;     /* SASS seqno when present (16-bit wrap tracked) */
   uint32_t own_seqno;      /* -Q stamp: cache's own monotonic seqno */
+  uint64_t khash1, khash2; /* shm: 128-bit key hash of the subject, computed
+                            * once (map seed); 0,0 = not yet */
+  MapIndex * midx;         /* RWF Map image: writer's key index, or NULL */
+  uint64_t image_serial;   /* heap: bumps per image write; shm: KeyCtx serial */
+  uint32_t dead_bytes_hint,/* Map tombstone bytes when no index tracks them */
+           tail_slack;     /* Map: trailing dead filler = append room, so a
+                            * grow does not copy the image every tick */
   uint16_t msg_type;       /* last MD_SASS msg type seen */
-  bool     has_seqno;
+  bool     has_seqno,
+           image_partial;  /* RWF multipart refresh in progress: the image
+                            * has CLEAR_CACHE's part but not REFRESH_COMPLETE
+                            * yet; serve waits (pending) until it lands */
   /* RouteSub trailing members */
   uint32_t hash;
   uint16_t len;
@@ -168,8 +201,22 @@ struct CacheEntry {
     this->own_seqno = 0;
     this->msg_type = 0;
     this->has_seqno = false;
+    this->image_partial = false;
+    this->midx = NULL;
+    this->khash1 = this->khash2 = 0;
+    this->image_serial = 0;
+    this->dead_bytes_hint = 0;
+    this->tail_slack = 0;
+  }
+  void release_index( void ) {
+    if ( this->midx != NULL ) {
+      this->midx->release();
+      ::free( this->midx );
+      this->midx = NULL;
+    }
   }
 };
+
 
 /* subject cache table.  Merge policy lives in cache_tab.cpp. */
 struct CacheTab {
@@ -187,22 +234,34 @@ struct CacheTab {
    * (uint8_t) of the raimd TYPE_ID -- the same slot raids uses for redis
    * value types, and MDMsg::unpack() accepts it as the msg_enc hint, so
    * unpacking always produces a message).  CacheEntry::image stays NULL.
-   * EvKeyCtx carries the subject key + 128-bit hash into KeyCtx ops (and
-   * is the unit the raids-style prefetch pipeline queues, when that
-   * lands - SPEC Milestone 3 notes) */
+   * CacheTab::set_key primes KeyCtx with the NUL-terminated subject key
+   * and the entry's cached 128-bit hash (khash1/2). */
   rai::kv::HashTab         * map;         /* EvShm.map when -m given */
   rai::kv::KeyCtx          * kctx;        /* shm key op context */
   rai::kv::HashSeed          hseed;       /* map hash seed for db 0 */
   rai::kv::WorkAllocT< 1024 > wrk;        /* kv work mem, reset per op */
-  char                     * keybuf,      /* EvKeyCtx placement buffer */
-                           * imgbuf;      /* shm get_image copy-out */
-  size_t                     keybuf_len,
-                             imgbuf_len;
+  char                     * imgbuf,      /* shm get_image copy-out */
+                           * keybuf;      /* KeyFragment: subject + NUL */
+  size_t                     imgbuf_len,
+                             keybuf_len;
+  /* RWF Map merge strategy (SPEC Milestone 5): in place with tombstones,
+   * or the phase-1 whole rebuild; a book below map_index_min live entries
+   * looks keys up by linear scan (0 = never index).  Measured 2026-09-23:
+   * the index is flat ~4us/update from 4 to 8400 keys, scan and rebuild
+   * grow with the book, so the default indexes everything. */
+  bool                       map_inplace;
+  uint32_t                   map_index_min;
+  uint64_t                   stats_inplace, stats_rebuild,
+                             stats_compactions, stats_index_rebuilds,
+                             stats_map_ns; /* merge time, both paths */
 
   CacheTab( rai::md::MDMsgDict &d ) : dict( d ), next_id( 1 ),
     scratch( 0 ), scratch2( 0 ), scratch_len( 0 ), scratch2_len( 0 ),
     image_bytes( 0 ), map( 0 ), kctx( 0 ),
-    keybuf( 0 ), imgbuf( 0 ), keybuf_len( 0 ), imgbuf_len( 0 ) {}
+    imgbuf( 0 ), keybuf( 0 ), imgbuf_len( 0 ), keybuf_len( 0 ),
+    map_inplace( true ), map_index_min( 1 ), stats_inplace( 0 ),
+    stats_rebuild( 0 ), stats_compactions( 0 ), stats_index_rebuilds( 0 ),
+    stats_map_ns( 0 ) {}
 
   /* attach the shm image store; no-op when shm.map == NULL (no -m) */
   void init_shm( rai::kv::EvShm &shm ) noexcept;
@@ -227,6 +286,8 @@ struct CacheTab {
   bool normalize_msg_type( const void *&bytes,  size_t &len,
                            uint32_t &enc ) noexcept;
   /* field-merge update bytes into e's image; rebuild + swap.  returns len */
+  size_t merge_heap( CacheEntry &e,  const void *upd,  size_t upd_len,
+                     uint32_t upd_enc ) noexcept; /* the field-list path */
   size_t merge( CacheEntry &e,  const void *upd,  size_t upd_len,
                 uint32_t upd_enc ) noexcept;
   /* fetch e's image for serving/forwarding: heap mode returns e.image
@@ -242,11 +303,50 @@ struct CacheTab {
   void ensure_scratch( size_t n ) noexcept;
   void ensure_scratch2( size_t n ) noexcept;
   /* --- shm internals (cache_tab.cpp) --- */
-  rai::kv::EvKeyCtx * key_of( const CacheEntry &e ) noexcept;
+  /* prime kctx with the entry's subject: the key is the NUL-terminated
+   * subject (keylen = len + 1, the raikv / raids string-key convention,
+   * copied into keybuf), the 128-bit hash is cached in the entry -- no
+   * per-op EvKeyCtx, no rehash */
+  void set_key( CacheEntry &e,  rai::kv::KeyCtx &kc ) noexcept;
+  /* start the HashEntry line towards the core while the update is still
+   * being parsed / planned; needs the cached hash (a prior op on the
+   * entry), a no-op in heap mode or on a fresh entry */
+  void prefetch( const CacheEntry &e,  bool for_write ) const {
+    if ( this->map != NULL && ( e.khash1 | e.khash2 ) != 0 )
+      this->map->prefetch( e.khash1, ! for_write );
+  }
   /* two-pass field-merge of upd over old into scratch; 0 = parse/overflow
    * failure (caller falls back to replace).  shared by heap + shm merge.
    * The writer comes from MDMsg::create_writer() so the merged image
    * keeps the cached message's own codec; out_enc = its type id */
+  /* RWF Map x Map (MARKET_BY_ORDER / MARKET_BY_PRICE / SYMBOL_LIST ...):
+   * entries keyed by the encoded key; ADD replaces, UPDATE field-merges
+   * the entry's field list, DELETE removes, summary field-merges.  The
+   * image keeps the refresh's set definitions; entries copied from the
+   * update that use set data are re-encoded as standard data.  Result
+   * in scratch, 0 on failure. */
+  size_t build_merge_map( const void *oldb,  size_t old_len,
+                          const void *upd,  size_t upd_len ) noexcept;
+  /* map_merge.cpp: in-place Map merge with tombstones + MapIndex */
+  size_t merge_map_inplace( CacheEntry &e,  const void *upd,
+                            size_t upd_len ) noexcept;
+  bool   plan_map_update( CacheEntry &e,  const uint8_t *img,  size_t len,
+                          const void *upd,  size_t upd_len,
+                          rai::md::MDMsgMem &mem,  void *plan,
+                          bool &use_index ) noexcept;
+  size_t map_grow_len( CacheEntry &e,  size_t img_len,  size_t append_total,
+                       size_t &slack_new ) noexcept;
+  void   commit_map_update( CacheEntry &e,  uint8_t *img,  size_t img_len,
+                            size_t new_len,  void *plan,
+                            bool use_index ) noexcept;
+  size_t strip_map( const uint8_t *img,  size_t len,  uint8_t *out ) noexcept;
+  /* serve: a Map image without tombstones (raw, or stripped into scratch) */
+  bool   live_image( CacheEntry &e,  void *&bytes,  size_t &len,
+                     uint32_t enc ) noexcept;
+  /* fid-keyed two-pass field list merge into mem; returns len, 0 fail */
+  size_t merge_field_lists( rai::md::MDMsgMem &mem,  const void *oldb,  size_t old_len,
+                            const void *upd,  size_t upd_len,
+                            void *&out ) noexcept;
   size_t build_merge( const void *oldb,  size_t old_len,  uint32_t old_enc,
                       const void *upd,  size_t upd_len,
                       uint32_t upd_enc,  uint32_t &out_enc ) noexcept;

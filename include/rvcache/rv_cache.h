@@ -81,6 +81,8 @@ struct RvCache {
     }
     this->stats.log_ns = poll.now_ns;
     this->cache.init_shm( s ); /* -m map_name: images live in raikv shm */
+    this->cache.map_inplace   = c.map_inplace;
+    this->cache.map_index_min = c.map_index_min;
   }
 
   uint32_t cur_mono( void ) const {
@@ -122,6 +124,15 @@ struct RvCache {
   /* omm provider side: EvOmmListen clients fed from the sass2/sass3
    * tick flow (sass -> RWF once per tick; EvOmmConn stamps per-client
    * stream ids; SPEC Milestone 4 client side) */
+  /* RWF-native path for Map payloads (MARKET_BY_ORDER / MARKET_BY_PRICE):
+   * the Map is cached as-is (RWF_MAP_TYPE_ID) and key-merged, refreshes
+   * may be multipart (image_partial until REFRESH_COMPLETE); forwarded
+   * only to omm nets, as the feed's own envelope with SOLICITED cleared */
+  void handle_rwf_map( uint32_t net,  const char *subj,  size_t len,
+                       RwfMsg &m ) noexcept;
+  void omm_forward_raw( const char *subj,  size_t len,  RwfMsg &m ) noexcept;
+  /* domain from the subject's sector (<svc>.MBO.<ric> -> 7), MP default */
+  uint8_t rwf_domain_of( const char *subj,  size_t len ) noexcept;
   void on_omm_sub( NotifySub &sub,  uint32_t net ) noexcept;
   /* another stream / a reissue on a subject already open: solicited
    * image again, no interest change */
