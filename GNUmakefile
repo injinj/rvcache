@@ -278,7 +278,7 @@ all_depends += $(rv_cache_deps)
 
 # test/map_bench: CacheTab::merge on RWF Map images with hw counters
 map_bench_files := map_bench cache_tab map_merge
-map_bench_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(map_bench_files))) $(omm_home)/$(build_dir)/obj/book_pub.o
+map_bench_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(map_bench_files)))
 map_bench_deps  := $(addprefix $(dependd)/, $(addsuffix .d, map_bench cache_tab map_merge))
 map_bench_libs  :=
 map_bench_lnk   := $(lnk_lib)
