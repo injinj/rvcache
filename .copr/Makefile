@@ -12,9 +12,9 @@ _ensure_git := $(shell command -v git >/dev/null 2>&1 || dnf -y install git-core
 
 git_hash    := $(shell git rev-parse --short=8 HEAD)
 major_num   := 1
-minor_num   := 6
+minor_num   := 7
 patch_num   := 0
-build_num   := 8
+build_num   := 9
 version     := $(major_num).$(minor_num).$(patch_num)
 ver_build   := $(version)-$(build_num)
 name_ver    := $(name)-$(ver_build)
@@ -49,3 +49,6 @@ rpmbuild/SOURCES/$(name_ver).tar.gz:
 .PHONY: spec_version
 spec_version:
 	@echo "$(name)_dep := $(major_num).$(minor_num)"
+.PHONY: spec_build
+spec_build:
+	@echo "$(name)_build := $(ver_build)"
